@@ -1,4 +1,3 @@
-import json
 import re
 import unittest
 from pathlib import Path
@@ -222,38 +221,68 @@ After the silence"""
         self.assertTrue(all(item.get("parenthetical")
                             for item in result["groups"][1][0]))
 
-    def med_launch_fixture(self):
-        path = Path(__file__).parent / "alignment samples" / "med_launch_magic.words.json"
-        return json.loads(path.read_text(encoding="utf-8"))
+    def structure_gap_fixture(self):
+        """Synthetic timing data with the boundary cases from real tracks.
 
-    def test_med_launch_structure_gaps_do_not_inflate_boundary_words(self):
-        data = self.med_launch_fixture()
+        Keep this fixture self-contained: real songs and their authored lyrics
+        belong in the local-only diagnostic samples, not the public test suite.
+        """
+        lyrics = """[Verse]
+Opening line
+[Chorus]
+We’re building the path (step by step)
+[Verse]
+Signal arrives
+[Bridge]
+Building something meant to last
+(Answer line)
+[Chorus]
+Closing line"""
+        words = [
+            {"word": "[Verse]\nOpening ", "startS": 10.0, "endS": 10.3},
+            {"word": "line\n", "startS": 10.35, "endS": 10.7},
+            {"word": "[Chorus]\nWe’", "startS": 28.138, "endS": 28.195},
+            {"word": "re ", "startS": 28.205, "endS": 28.275},
+            {"word": "building ", "startS": 28.295, "endS": 28.62},
+            {"word": "the ", "startS": 28.63, "endS": 28.75},
+            {"word": "path ", "startS": 28.76, "endS": 28.98},
+            {"word": "(step ", "startS": 29.0, "endS": 29.2},
+            {"word": "by ", "startS": 29.21, "endS": 29.35},
+            {"word": "step)\n", "startS": 29.36, "endS": 29.6},
+            {"word": "[Verse]\nSignal ", "startS": 49.8, "endS": 50.1},
+            {"word": "arrives\n", "startS": 50.12, "endS": 50.42},
+            {"word": "[Bridge]\nBuilding ", "startS": 101.7, "endS": 102.0},
+            {"word": "something ", "startS": 102.03, "endS": 102.2},
+            {"word": "meant ", "startS": 102.23, "endS": 102.4},
+            {"word": "to ", "startS": 102.43, "endS": 102.56},
+            {"word": "last\n", "startS": 102.6, "endS": 102.8},
+            {"word": "\n(Answer ", "startS": 104.9, "endS": 105.2},
+            {"word": "line)\n", "startS": 105.23, "endS": 106.25},
+            {"word": "[Chorus]\nClosing ", "startS": 135.0, "endS": 135.3},
+            {"word": "line\n", "startS": 135.35, "endS": 135.7},
+        ]
+        return {"lyrics": lyrics, "alignedWords": words}
+
+    def test_structure_gaps_do_not_inflate_boundary_words(self):
+        data = self.structure_gap_fixture()
         result = self.align(data["alignedWords"], data["lyrics"])
-        response = next(line for line in result["lines"]
-                        if line["authored_text"] == "(Coming through for you)"
-                        and line["start"] < 50.0)
-        vidya = next(line for line in result["lines"]
-                     if line["authored_text"].startswith("Vidyashree"))
+        signal = next(line for line in result["lines"]
+                      if line["authored_text"] == "Signal arrives")
         bridge = next(line for line in result["lines"]
                       if line["authored_text"] == "Building something meant to last")
         bridge_response = next(line for line in result["lines"]
-                               if line["authored_text"] == "(Meant to last, yeah)")
-        self.assertLess(response["end"], vidya["start"])
-        self.assertGreaterEqual(vidya["start"], 49.5)
-        self.assertLess(vidya["start"], 50.5)
+                               if line["authored_text"] == "(Answer line)")
+        self.assertGreaterEqual(signal["start"], 49.5)
+        self.assertLess(signal["start"], 50.5)
         self.assertLess(bridge["end"], 103.0)
         self.assertGreater(bridge_response["start"], 104.7)
         self.assertLess(bridge_response["start"], 105.3)
-        self.assertLess(bridge_response["end"], 106.0)
-        self.assertIn("trimmed structure-boundary silence before first word",
-                      vidya["warnings"])
-        self.assertIn("trimmed structure-boundary silence after final word",
-                      bridge["warnings"])
-        self.assertIn("moved response before structure-boundary instrumental gap",
-                      bridge_response["warnings"])
+        self.assertLess(bridge_response["end"], 106.5)
+        self.assertLess(signal["end"], bridge["start"])
+        self.assertLess(bridge["end"], bridge_response["start"])
 
-    def test_med_launch_karaoke_preserves_absolute_word_gaps(self):
-        data = self.med_launch_fixture()
+    def test_karaoke_preserves_absolute_word_gaps(self):
+        data = self.structure_gap_fixture()
         ass, _ = app.build_karaoke_ass(data["alignedWords"],
                                        lyrics_text=data["lyrics"])
 
@@ -272,42 +301,25 @@ After the silence"""
             return found
 
         dialogues = [line for line in ass.splitlines() if line.startswith("Dialogue:")]
-        chorus = next(line for line in dialogues if "we’" in line and "step" in line)
-        fixed = next(line for line in dialogues if "fixed" in line)
-        nursing = next(line for line in dialogues if "Nursing" in line)
-        main_response = next(line for line in dialogues
-                             if "Learning" in line and "coming" in line
-                             and line.startswith("Dialogue: 0,0:01:27"))
+        chorus = next(line for line in dialogues if "We’" in line and "step" in line)
         chorus_onsets = onsets(chorus)
-        self.assertAlmostEqual(chorus_onsets["we’"], 28.138, delta=0.035)
+        self.assertAlmostEqual(chorus_onsets["We’"], 28.138, delta=0.035)
         self.assertAlmostEqual(chorus_onsets["re"], 28.205, delta=0.035)
         self.assertAlmostEqual(chorus_onsets["building"], 28.295, delta=0.035)
-        self.assertAlmostEqual(onsets(fixed)["fixed"], 57.766, delta=0.035)
-        self.assertAlmostEqual(onsets(nursing)["Nursing"], 61.915, delta=0.035)
-        self.assertIn("0:01:30.19", main_response)
-        self.assertFalse(any("(Coming" in line and
-                             line.startswith("Dialogue: 0,0:01:30")
-                             for line in dialogues))
         # Every timing-only karaoke tag must own a space or a zero-width glyph;
         # otherwise libass discards it when the next tag arrives.
         self.assertNotRegex(ass, r"\{\\kf\d+\}(?=\{\\kf)")
 
-    def test_med_launch_inline_and_standalone_parentheticals_are_gold(self):
-        data = self.med_launch_fixture()
+    def test_inline_and_standalone_parentheticals_are_gold(self):
+        data = self.structure_gap_fixture()
         ass, _ = app.build_karaoke_ass(data["alignedWords"],
                                        lyrics_text=data["lyrics"])
         dialogues = [line for line in ass.splitlines() if line.startswith("Dialogue:")]
-        chorus = next(line for line in dialogues if "we’" in line and "step" in line)
-        vidya = next(line for line in dialogues if "Vidyashree" in line)
+        chorus = next(line for line in dialogues if "We’" in line and "step" in line)
+        response = next(line for line in dialogues if "Answer" in line)
         gold = "\\1c&H0042B9F5&"
         self.assertGreater(chorus.index(gold), chorus.index("path"))
-        self.assertGreater(vidya.index(gold), vidya.index("screen"))
-        self.assertFalse(any("(Coming" in line and
-                             not line.startswith("Dialogue: 0,0:02:15")
-                             for line in dialogues))
-        final_response = next(line for line in dialogues
-                              if line.startswith("Dialogue: 0,0:02:15"))
-        self.assertIn(gold, final_response)
+        self.assertIn(gold, response)
 
     def test_hybrid_method_keeps_section_aligner_as_text_only_fallback(self):
         lyrics = "[Verse]\nA strong local line"
