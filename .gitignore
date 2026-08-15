@@ -1,0 +1,19 @@
+# This repository deliberately tracks only the publishable source, tests, and
+# documentation from the local development folder. Generated app bundles,
+# media, diagnostic output, historical backups, and local configuration stay
+# untracked.
+*
+!.gitignore
+!README.md
+!SECURITY.md
+!suno_studio.py
+!stable_ts_hybrid.py
+!subs_doctor.py
+!video_doctor.py
+!test_lyric_alignment.py
+!test_app_reliability.py
+!lyrics-parsing.md
+!Start Suno Studio.command
+!Check Subtitles.command
+!Diagnose Video.command
+!Install Local Lyric Alignment.command
