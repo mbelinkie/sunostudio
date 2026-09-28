@@ -11,6 +11,8 @@ sheet. No video encoding, so a full pass takes seconds instead of minutes.
     python3 subs_doctor.py song.mp3 --frames 12  # cap the contact sheet
     python3 subs_doctor.py song.mp3 --no-frames  # timeline only, instant
     python3 subs_doctor.py song.mp3 --stable-ts  # local forced-align + repair
+    python3 subs_doctor.py song.mp3 --export-timings
+    python3 subs_doctor.py song.mp3 --apply-timings song.timings.tsv
 
 Outputs next to this script:
     subs_report.txt     the timeline + warnings
@@ -69,15 +71,47 @@ def recover_lyrics(folder):
         try:
             body = cand.read_text(encoding="utf-8")
             if "-" * 20 in body:
-                return body.split("-" * 20, 1)[1].strip()
+                saved = body.split("-" * 20, 1)[1].strip()
+                spoken, marker, shown = saved.partition("\n===DISPLAY LYRICS===\n")
+                return spoken.strip(), shown.strip() if marker else ""
         except Exception:
             pass
-    return ""
+    return "", ""
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args, flags = [], []
+    apply_timings, export_timings = None, None
+    raw_args, index = sys.argv[1:], 0
+    while index < len(raw_args):
+        argument = raw_args[index]
+        if argument == "--apply-timings":
+            if index + 1 >= len(raw_args):
+                say("--apply-timings needs a TSV path")
+                return finish()
+            apply_timings = raw_args[index + 1]
+            flags.append(argument)
+            index += 2
+        elif argument.startswith("--apply-timings="):
+            apply_timings = argument.split("=", 1)[1]
+            flags.append("--apply-timings")
+            index += 1
+        elif argument == "--export-timings":
+            export_timings = True
+            flags.append(argument)
+            index += 1
+        elif argument.startswith("--"):
+            flags.append(argument)
+            # Preserve the existing --frames 12 spelling while keeping its
+            # numeric value out of the positional song argument list.
+            if argument == "--frames" and index + 1 < len(raw_args):
+                flags.append(raw_args[index + 1])
+                index += 2
+            else:
+                index += 1
+        else:
+            args.append(argument)
+            index += 1
     want_frames = "--no-frames" not in flags
     aligner = "legacy" if "--legacy" in flags else "section"
     want_stable_ts = "--stable-ts" in flags
@@ -110,7 +144,9 @@ def main():
 
     data = json.loads(words.read_text())
     aligned = data.get("alignedWords") or []
-    lyrics = data.get("lyrics") or recover_lyrics(folder)
+    recovered_lyrics, recovered_display = recover_lyrics(folder)
+    lyrics = data.get("lyrics") or recovered_lyrics
+    display_lyrics = data.get("display_lyrics") or recovered_display
     say(f"words   {len(aligned)} timed")
     say(f"lyrics  {'cached with the timings' if data.get('lyrics') else 'recovered from the .txt sidecar' if lyrics else 'MISSING - falling back to guessed line breaks'}")
     if aligned:
@@ -129,15 +165,36 @@ def main():
                 audio, lyrics, aligned, app.find_ffmpeg(), log=say)
             aligned = hybrid["alignedWords"]
 
+    render_lyrics = (hybrid.get("safe_lyrics") or "") if hybrid else lyrics
+    render_display = app.safe_display_lyrics(display_lyrics, hybrid) if hybrid else display_lyrics
+
     # ---- does the mapping hold? ----
     alignment = (None if hybrid else
                  app.align_lyrics(aligned, lyrics, method=aligner) if lyrics else None)
-    mapped = app.lines_from_lyrics(
-        aligned, hybrid.get("safe_lyrics") or "", method="section") if hybrid else \
+    mapped = app.lines_from_lyrics(aligned, render_lyrics, method="section") if hybrid else \
         alignment.get("groups") if alignment else None
     say(f"\naligner: {hybrid.get('method') if hybrid else alignment.get('method') if alignment else 'audio structure only'}")
     say(f"line breaks: {'from your lyrics' if mapped else 'GUESSED (lyrics did not match the audio)'}")
-    groups = mapped or app.group_lyric_lines(aligned)
+    display_warnings = []
+    groups = app.karaoke_groups(aligned, render_lyrics, aligner_method=aligner,
+                                display_lyrics=render_display,
+                                display_warnings=display_warnings)
+    for warning in display_warnings:
+        say(f"display warning: {warning}")
+    timing_groups = None
+    default_timing_path = folder / f"{stem}.timings.tsv"
+    if export_timings:
+        app.export_timing_sidecar(default_timing_path, groups)
+        say(f"timings exported: {default_timing_path}")
+    if apply_timings:
+        timing_path = Path(apply_timings).expanduser()
+        try:
+            timing_groups = app.apply_timing_sidecar(timing_path, groups)
+        except ValueError as error:
+            say(f"timing sidecar error: {error}")
+            return finish()
+        groups = timing_groups
+        say(f"timings applied: {timing_path}")
     if hybrid:
         say(f"stable-ts lines: {hybrid.get('rendered_source_lines', 0)}/"
             f"{hybrid.get('authored_lines', 0)}")
@@ -238,8 +295,10 @@ def main():
         return finish()
 
     ass_text, n = app.build_karaoke_ass(aligned, font=app.ass_font_name(),
-                                        lyrics_text=(hybrid.get("safe_lyrics") or "") if hybrid else lyrics,
-                                        aligner_method=aligner)
+                                        lyrics_text=render_lyrics,
+                                        display_lyrics=render_display,
+                                        aligner_method=aligner,
+                                        timing_groups=timing_groups)
     ass = folder / f"{stem}.preview.ass"
     ass.write_text(ass_text, encoding="utf-8")
 

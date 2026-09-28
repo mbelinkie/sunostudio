@@ -10,6 +10,31 @@ from pathlib import Path
 import suno_studio as app
 
 
+def post_json(path, payload):
+    """Exercise one local JSON route without opening a listening socket."""
+    raw = json.dumps(payload).encode("utf-8")
+
+    class Request(app.Handler):
+        def __init__(self):
+            self.path = path
+            self.headers = {"Content-Length": str(len(raw))}
+            self.rfile = io.BytesIO(raw)
+            self.wfile = io.BytesIO()
+
+        def send_response(self, _code):
+            pass
+
+        def send_header(self, _name, _value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    request = Request()
+    app.Handler.do_POST(request)
+    return json.loads(request.wfile.getvalue())
+
+
 class ReliabilityTests(unittest.TestCase):
     def test_generation_keeps_only_first_provider_version(self):
         tracks = [{"id": "first"}, {"id": "second"}]
@@ -44,6 +69,36 @@ class ReliabilityTests(unittest.TestCase):
         self.assertIn("colors=0xF27F36", graph)
         self.assertEqual(args[-3:], ["-f", "mp4", "video.mp4"])
 
+    def test_video_bitrate_budget_keeps_long_song_under_30_mb(self):
+        video_kbps, audio_kbps = app.video_bitrate_budget(180)
+        payload_bytes = (video_kbps + audio_kbps) * 1000 * 180 / 8
+        self.assertLessEqual(payload_bytes,
+                             app.MAX_VIDEO_BYTES * app.VIDEO_SIZE_HEADROOM)
+        self.assertLess(video_kbps, 2500)
+        self.assertEqual(audio_kbps, 192)
+
+    def test_oversize_render_is_recompressed_before_returning(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "video.mp4"
+            renders = []
+
+            def fake_run(_ff, args, *_positional, **_keyword):
+                renders.append(args)
+                with Path(args[-1]).open("wb") as stream:
+                    stream.truncate(31_000_000 if len(renders) == 1 else 25_000_000)
+
+            with mock.patch.object(app, "ffmpeg_filters", return_value=set()), \
+                    mock.patch.object(app, "audio_duration", return_value=180.0), \
+                    mock.patch.object(app, "run_ffmpeg", side_effect=fake_run):
+                app.render_lyric_video(
+                    "ffmpeg", "song.mp3", "background.png", None, out,
+                    vis="off", shimmer=False, interlude_mode=False,
+                    lyric_focus_band=False)
+
+            self.assertEqual(len(renders), 2)
+            self.assertLessEqual(out.stat().st_size, app.MAX_VIDEO_BYTES)
+            self.assertIn("-b:v", renders[1])
+
     def test_email_title_marker_survives_leading_zero_width_character(self):
         body = ("\u200c===TITLE===\nThe Med Launch Magic\n\n"
                 "===STYLE===\n70s soul, horn section, group vocals, warm\n\n"
@@ -55,6 +110,106 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(form["recipient"], "author@example.com")
         self.assertEqual(app.compose_basename(form["tagline"], form["title"]),
                          "Learning Path 26.3.2 - The Med Launch Magic")
+
+    def test_delivery_headers_parse_in_both_email_layouts(self):
+        headers = ("Title: Header Song\nStyle: synth pop\nDelivery: Slack\n"
+                   "Slack Channel ID: C123ABC\nRecipient: author@example.com\n"
+                   "---\n[Verse]\nWords go here")
+        section_blocks = ("===TITLE===\nSection Song\n===STYLE===\nsynth pop\n"
+                          "===DELIVERY===\nEmail\n===RECIPIENT===\n"
+                          "Author <author@example.com>\n===SLACK CHANNEL ID===\n"
+                          "C456DEF\n===LYRICS===\n[Verse]\nWords go here")
+        header_form = app.parse_request("Header Song", headers)
+        section_form = app.parse_request("Section Song", section_blocks)
+        self.assertEqual((header_form["delivery_mode"], header_form["slack_channel_id"]),
+                         ("slack", "C123ABC"))
+        self.assertEqual(header_form["recipient"], "author@example.com")
+        self.assertEqual((section_form["delivery_mode"], section_form["recipient"]),
+                         ("email", "author@example.com"))
+        self.assertEqual(section_form["slack_channel_id"], "C456DEF")
+
+    def test_delivery_is_none_by_default_even_when_destinations_are_present(self):
+        form = app.parse_request(
+            "Song", "Recipient: author@example.com\nSlack Channel ID: C123ABC\n---\n[Verse]\nWords")
+        self.assertEqual(form["delivery_mode"], "none")
+        self.assertEqual(form["recipient"], "author@example.com")
+        self.assertEqual(form["slack_channel_id"], "C123ABC")
+        self.assertEqual(app.delivery_details(form), ("none", "", ""))
+
+    def test_manual_generate_route_defaults_delivery_to_none_and_persists_it(self):
+        old_jobs, old_forms = app.JOBS, app.JOB_FORMS
+        try:
+            app.JOBS, app.JOB_FORMS = {}, {}
+            with mock.patch.object(app, "_save_jobs_locked"), \
+                    mock.patch.object(app.threading, "Thread"):
+                result = post_json("/api/generate", {
+                    "title": "Manual", "style": "synth pop", "lyrics": "A chorus"})
+            self.assertTrue(result["ok"])
+            job = app.JOBS[result["id"]]
+            self.assertEqual(job["current_fields"]["delivery_mode"], "none")
+            self.assertEqual(job["delivery_status"], "not_requested")
+            self.assertIn('id="manualcard"', app.PAGE)
+            self.assertIn('id="manual_delivery_mode"', app.PAGE)
+        finally:
+            app.JOBS, app.JOB_FORMS = old_jobs, old_forms
+
+    def test_inbox_approval_persists_explicit_delivery_choice(self):
+        old_jobs, old_forms, old_inbox = app.JOBS, app.JOB_FORMS, app.INBOX
+        try:
+            app.JOBS, app.JOB_FORMS = {}, {}
+            app.INBOX = {"request": {"id": "request", "from": "author@example.com",
+                "form": app.parse_request(
+                    "Song", "Delivery: Slack\nSlack Channel ID: C123ABC\n---\n[Verse]\nWords")}}
+            with mock.patch.object(app, "_save_jobs_locked"), \
+                    mock.patch.object(app, "_save_inbox_locked"), \
+                    mock.patch.object(app.threading, "Thread"):
+                result = post_json("/api/inbox/approve", {"id": "request"})
+            self.assertTrue(result["ok"])
+            job = next(iter(app.JOBS.values()))
+            self.assertEqual(job["delivery_mode"], "slack")
+            self.assertEqual(job["delivery_destination"], "C123ABC")
+            self.assertEqual(job["current_fields"]["slack_channel_id"], "C123ABC")
+            self.assertNotIn("request", app.INBOX)
+        finally:
+            app.JOBS, app.JOB_FORMS, app.INBOX = old_jobs, old_forms, old_inbox
+
+    def test_delivery_modes_validate_destinations_without_inferring_a_mode(self):
+        self.assertEqual(app.delivery_details({"delivery_mode": "none",
+                                               "recipient": "reader@example.com"}),
+                         ("none", "", ""))
+        self.assertEqual(app.delivery_details({"delivery_mode": "email",
+                                               "recipient": "Reader <reader@example.com>"}),
+                         ("email", "reader@example.com", ""))
+        self.assertEqual(app.delivery_details({"delivery_mode": "slack",
+                                               "slack_channel_id": "C123ABC"}),
+                         ("slack", "C123ABC", ""))
+        self.assertTrue(app.delivery_details({"delivery_mode": "email",
+                                              "recipient": "not-an-email"})[2])
+        self.assertTrue(app.delivery_details({"delivery_mode": "slack",
+                                              "slack_channel_id": "general"})[2])
+
+    def test_delivery_retry_reuses_published_video_without_rendering(self):
+        old_jobs = app.JOBS
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "published.mp4"
+                video.write_bytes(b"already rendered")
+                app.JOBS = {"job": {"id": "job", "pipeline": True, "status": "completed",
+                    "final_path": str(video), "delivery_status": "error",
+                    "current_fields": {"title": "Song", "delivery_mode": "slack",
+                                       "slack_channel_id": "C123ABC"}}}
+                with mock.patch.object(app, "_save_jobs_locked"), \
+                        mock.patch.object(app.threading, "Thread") as thread, \
+                        mock.patch.object(app, "run_video_job") as render:
+                    app.pipeline_action("job", "retry_delivery", {
+                        "delivery_mode": "slack", "slack_channel_id": "C123ABC"})
+                self.assertEqual(app.JOBS["job"]["status"], "completed")
+                self.assertEqual(app.JOBS["job"]["delivery_status"], "queued")
+                self.assertEqual(video.read_bytes(), b"already rendered")
+                self.assertEqual(thread.call_args.kwargs["target"], app.send_job_delivery)
+                render.assert_not_called()
+        finally:
+            app.JOBS = old_jobs
 
     def test_pipeline_filename_uses_the_approved_sprint_and_title(self):
         self.assertEqual(app.compose_basename(
@@ -73,6 +228,183 @@ class ReliabilityTests(unittest.TestCase):
                                     {"recipient": "New Recipient <new@example.com>"})
             self.assertEqual(app.JOBS["job"]["current_fields"]["recipient"], "new@example.com")
             publish.assert_called_once_with("job")
+        finally:
+            app.JOBS = old_jobs
+
+    def test_invalid_destination_keeps_the_approved_mp4_and_sets_delivery_error(self):
+        old_jobs, old_forms = app.JOBS, app.JOB_FORMS
+        old_config = dict(app.CONFIG)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                staging = root / "staging"
+                staging.mkdir()
+                video = staging / "approved.mp4"
+                video.write_bytes(b"finished video")
+                app.CONFIG.update({"output_dir": str(root / "Final"), "video_dir": ""})
+                app.JOBS = {"job": {"id": "job", "pipeline": True,
+                    "status": "paused_video", "video_path": str(video),
+                    "staging_folder": str(staging),
+                    "current_fields": {"title": "Approved", "delivery_mode": "email",
+                                       "recipient": "not-an-email"},
+                    "tracks": [], "song_variants": [], "image_variants": []}}
+                app.JOB_FORMS = {}
+                with mock.patch.object(app, "_save_jobs_locked"):
+                    app.finalize_pipeline_job("job")
+                job = app.JOBS["job"]
+                self.assertEqual(job["status"], "completed")
+                self.assertEqual(job["delivery_status"], "error")
+                self.assertIn("valid recipient", job["delivery_error"])
+                self.assertEqual(Path(job["final_path"]).read_bytes(), b"finished video")
+        finally:
+            app.JOBS, app.JOB_FORMS = old_jobs, old_forms
+            app.CONFIG.clear(); app.CONFIG.update(old_config)
+
+    def test_email_delivery_uses_configured_gmail_and_stores_receipt(self):
+        old_jobs, old_factory = app.JOBS, app.EMAIL_LINK_FACTORY
+        old_config = dict(app.CONFIG)
+        sent = []
+
+        class SMTP:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def login(self, user, password):
+                self.credentials = (user, password)
+
+            def send_message(self, message):
+                sent.append(message)
+                return {}
+
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "video.mp4"
+                video.write_bytes(b"video")
+                app.CONFIG.update({"gmail_user": "sender@gmail.com",
+                                   "gmail_app_password": "app-password"})
+                app.EMAIL_LINK_FACTORY = lambda job: {
+                    "url": "https://private.example/valid-seven-days",
+                    "uri": "gs://private/delivery-object"}
+                app.JOBS = {"job": {"id": "job", "pipeline": True, "status": "completed",
+                    "final_path": str(video), "title": "Song",
+                    "delivery_mode": "email", "delivery_destination": "reader@example.com",
+                    "delivery_status": "queued", "current_fields": {
+                        "delivery_mode": "email", "recipient": "reader@example.com"}}}
+                with mock.patch.object(app.smtplib, "SMTP_SSL", return_value=SMTP()), \
+                        mock.patch.object(app, "_save_jobs_locked"):
+                    app.send_job_delivery("job")
+                job = app.JOBS["job"]
+                self.assertEqual(job["status"], "completed")
+                self.assertEqual(job["delivery_status"], "sent")
+                self.assertEqual(job["delivery_receipt"]["recipient"], "reader@example.com")
+                self.assertIn("https://private.example/valid-seven-days", sent[0].get_content())
+        finally:
+            app.JOBS, app.EMAIL_LINK_FACTORY = old_jobs, old_factory
+            app.CONFIG.clear(); app.CONFIG.update(old_config)
+
+    def test_smtp_failure_leaves_completed_video_available(self):
+        old_jobs, old_factory = app.JOBS, app.EMAIL_LINK_FACTORY
+        old_config = dict(app.CONFIG)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "video.mp4"
+                video.write_bytes(b"still available")
+                app.CONFIG.update({"gmail_user": "sender@gmail.com",
+                                   "gmail_app_password": "app-password"})
+                app.EMAIL_LINK_FACTORY = lambda _job: "https://private.example/download"
+                app.JOBS = {"job": {"id": "job", "pipeline": True, "status": "completed",
+                    "final_path": str(video), "title": "Song", "delivery_status": "queued",
+                    "current_fields": {"delivery_mode": "email", "recipient": "reader@example.com"}}}
+                with mock.patch.object(app.smtplib, "SMTP_SSL", side_effect=OSError("offline")), \
+                        mock.patch.object(app, "_save_jobs_locked"):
+                    app.send_job_delivery("job")
+                self.assertEqual(app.JOBS["job"]["status"], "completed")
+                self.assertEqual(app.JOBS["job"]["delivery_status"], "error")
+                self.assertTrue(app.JOBS["job"]["delivery_error"])
+                self.assertEqual(video.read_bytes(), b"still available")
+        finally:
+            app.JOBS, app.EMAIL_LINK_FACTORY = old_jobs, old_factory
+            app.CONFIG.clear(); app.CONFIG.update(old_config)
+
+    def test_slack_external_upload_returns_a_channel_receipt_without_real_network(self):
+        class Response:
+            def __init__(self, payload=b"ok", status=200):
+                self.payload, self.status = payload, status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        responses = [
+            Response(json.dumps({"ok": True, "file_id": "F123", "upload_url": "https://upload.example"}).encode()),
+            Response(),
+            Response(json.dumps({"ok": True, "files": [{"permalink": "https://slack.example/file"}]}).encode()),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "video.mp4"
+            video.write_bytes(b"mp4-bytes")
+            with mock.patch.object(app.urllib.request, "urlopen", side_effect=responses) as request:
+                receipt = app.slack_upload_mp4(video, "C123ABC", "xoxb-test")
+            self.assertEqual(receipt["file_id"], "F123")
+            self.assertEqual(receipt["channel_id"], "C123ABC")
+            self.assertEqual(receipt["permalink"], "https://slack.example/file")
+            self.assertEqual(request.call_count, 3)
+            completion = json.loads(request.call_args_list[2].args[0].data)
+            self.assertEqual(completion["channel_id"], "C123ABC")
+
+    def test_slack_upload_failure_does_not_expose_its_temporary_upload_url(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"ok": True, "file_id": "F123",
+                                   "upload_url": "https://upload.example/private-secret"}).encode()
+
+        with tempfile.TemporaryDirectory() as td:
+            video = Path(td) / "video.mp4"
+            video.write_bytes(b"mp4")
+            with mock.patch.object(app.urllib.request, "urlopen",
+                                   side_effect=[Response(), OSError("private-secret")]):
+                with self.assertRaises(app.SlackDeliveryError) as raised:
+                    app.slack_upload_mp4(video, "C123ABC", "xoxb-test")
+            self.assertNotIn("private-secret", str(raised.exception))
+
+    def test_uncertain_slack_completion_requires_review_before_retry(self):
+        old_jobs = app.JOBS
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                video = Path(td) / "video.mp4"
+                video.write_bytes(b"mp4")
+                app.JOBS = {"job": {"id": "job", "pipeline": True, "status": "completed",
+                    "final_path": str(video), "delivery_mode": "slack",
+                    "delivery_destination": "C123ABC", "delivery_status": "queued",
+                    "current_fields": {"delivery_mode": "slack", "slack_channel_id": "C123ABC"}}}
+                with mock.patch.object(app, "_save_jobs_locked"), \
+                        mock.patch.object(app, "slack_upload_mp4",
+                                          side_effect=app.SlackDeliveryError("lost completion response", True)):
+                    app.send_job_delivery("job")
+                self.assertEqual(app.JOBS["job"]["delivery_status"], "needs_review")
+                with self.assertRaisesRegex(RuntimeError, "Review the interrupted delivery"):
+                    app.queue_delivery("job")
+                with mock.patch.object(app.threading, "Thread") as thread, \
+                        mock.patch.object(app, "_save_jobs_locked"):
+                    self.assertTrue(app.queue_delivery("job", allow_uncertain_retry=True))
+                self.assertEqual(app.JOBS["job"]["delivery_status"], "queued")
+                self.assertTrue(thread.called)
         finally:
             app.JOBS = old_jobs
 
@@ -102,6 +434,19 @@ class ReliabilityTests(unittest.TestCase):
     def test_completed_job_reveal_uses_final_file_not_deleted_staging_folder(self):
         self.assertIn("const revealPath = j.final_path || j.folder;", app.PAGE)
         self.assertIn('["open", "-R", str(target)]', inspect.getsource(app.Handler.do_POST))
+
+    def test_job_sections_keep_their_open_state_across_periodic_refreshes(self):
+        page = app.PAGE
+        self.assertIn("function snapshotJobSectionState()", page)
+        self.assertIn("function sectionAttrs(job, section, initiallyOpen)", page)
+        self.assertIn("snapshotJobSectionState();\n  const {jobs, inbox, watch, alerts}", page)
+        for call in (
+                "sectionAttrs(j.id,'job',true)",
+                "sectionAttrs(id,'song',true)",
+                "sectionAttrs(j.id,'image',true)",
+                "sectionAttrs(id,'video',true)",
+                "sectionAttrs(id,'subtitles',false)"):
+            self.assertIn(call, page)
 
     def test_sender_allowlist_uses_exact_mailbox_or_domain(self):
         old = app.CONFIG.get("allowed_senders")

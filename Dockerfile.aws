@@ -1,0 +1,18 @@
+FROM python:3.11.9-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-liberation fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && printf '%s\n' \
+       '<?xml version="1.0"?>' \
+       '<fontconfig><match target="pattern"><test name="family"><string>Helvetica</string></test><edit name="family" mode="assign"><string>Liberation Sans</string></edit></match></fontconfig>' \
+       > /etc/fonts/conf.d/99-suno-font-alias.conf \
+    && ffmpeg -hide_banner -filters 2>&1 | grep -q ' subtitles ' \
+    && ffmpeg -hide_banner -filters 2>&1 | grep -q ' drawtext '
+
+WORKDIR /app
+COPY requirements-cloud.txt aws_worker.py suno_studio.py ./
+RUN pip install --no-cache-dir -r requirements-cloud.txt
+CMD ["python", "aws_worker.py"]

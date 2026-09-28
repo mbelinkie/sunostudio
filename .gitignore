@@ -5,15 +5,33 @@
 *
 !.gitignore
 !README.md
+!SETUP.md
+!LICENSE
 !SECURITY.md
 !suno_studio.py
+!bug_reports.py
 !stable_ts_hybrid.py
 !subs_doctor.py
 !video_doctor.py
+!Dockerfile.aws
+!aws_render.py
+!aws_worker.py
+!aws_link.py
+!requirements-cloud.txt
+!setup_aws.py
+!build_release.py
 !test_lyric_alignment.py
 !test_app_reliability.py
+!test_bug_reports.py
+!test_aws_render.py
+!test_aws_link.py
+!test_aws_app.py
 !lyrics-parsing.md
 !Start Suno Studio.command
+!Start Suno Studio.bat
 !Check Subtitles.command
 !Diagnose Video.command
+!Check Video Tools.ps1
 !Install Local Lyric Alignment.command
+!alignment samples/
+!alignment samples/timing_sidecar_trivia.ass

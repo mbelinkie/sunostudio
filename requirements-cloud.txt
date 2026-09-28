@@ -1,0 +1,2 @@
+# Optional AWS rendering, setup, and private email links.
+boto3==1.43.103

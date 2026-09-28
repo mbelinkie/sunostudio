@@ -1,4 +1,5 @@
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -336,6 +337,229 @@ Closing line"""
         ass, rendered = app.build_karaoke_ass(words, lyrics_text="")
         self.assertEqual(rendered, 1)
         self.assertIn("\\1c&H0042B9F5&", ass)
+
+
+class TimingSidecarTests(unittest.TestCase):
+    """The TSV is deliberately tested at the renderer-group boundary."""
+
+    def trivia_groups(self):
+        words = [
+            ("It’s", 20.43, 20.65), ("time", 20.65, 20.99),
+            ("to", 20.99, 21.41), ("press", 21.41, 21.61),
+            ("play", 21.61, 22.01), ("on", 22.01, 22.45),
+            ("a", 22.45, 22.79), ("groovy", 22.79, 23.17),
+            ("design!", 23.17, 24.31), ("trivia", 26.13, 27.35),
+        ]
+        later = [("Later", 30.00, 30.30), ("section", 30.31, 30.80),
+                 ("stays", 30.81, 31.20)]
+        return [[[{"w": text, "s": start, "e": end}
+                  for text, start, end in words]],
+                [[{"w": text, "s": start, "e": end}
+                  for text, start, end in later]]]
+
+    def sidecar_path(self, groups):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "song.timings.tsv"
+        app.export_timing_sidecar(path, groups)
+        return path
+
+    def replace_timing(self, path, text, start=None, end=None, replacement_text=None):
+        rows = path.read_text(encoding="utf-8").splitlines()
+        for index, row in enumerate(rows[1:], 1):
+            columns = row.split("\t")
+            if columns[-1] == text:
+                if start is not None:
+                    columns[2] = start
+                if end is not None:
+                    columns[3] = end
+                if replacement_text is not None:
+                    columns[4] = replacement_text
+                rows[index] = "\t".join(columns)
+                path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                return
+        self.fail(f"missing TSV word {text!r}")
+
+    def test_sidecar_round_trip_and_unicode_are_stable(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        original = path.read_text(encoding="utf-8")
+        self.assertIn("It’s", original)
+        revised = app.apply_timing_sidecar(path, groups)
+        self.assertEqual(app.timing_sidecar_text(revised), original)
+
+    def test_moving_trivia_earlier_keeps_other_words_and_sections_fixed(self):
+        fixture = (Path(__file__).parent / "alignment samples" /
+                   "timing_sidecar_trivia.ass").read_text(encoding="utf-8")
+        self.assertIn("{\\kf182} {\\kf122}trivia", fixture)
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", start="00:00:26.000")
+        revised = app.apply_timing_sidecar(path, groups)
+        self.assertEqual(revised[0][0][8]["s"], 23.17)
+        self.assertEqual(revised[0][0][9]["s"], 26.0)
+        self.assertEqual(revised[1][0][0]["s"], 30.0)
+        before, _ = app.build_karaoke_ass([], timing_groups=groups)
+        after, _ = app.build_karaoke_ass([], timing_groups=revised)
+        before_dialogues = [line for line in before.splitlines()
+                            if line.startswith("Dialogue:")]
+        after_dialogues = [line for line in after.splitlines()
+                           if line.startswith("Dialogue:")]
+        self.assertIn("{\\kf114}design!{\\kf169} {\\kf135}trivia", after_dialogues[0])
+        self.assertEqual(after_dialogues[0].split(",", 9)[:9],
+                         before_dialogues[0].split(",", 9)[:9])
+        self.assertEqual(after_dialogues[1], before_dialogues[1])
+
+    def test_moving_one_word_later_does_not_shift_later_words(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", start="00:00:26.200")
+        revised = app.apply_timing_sidecar(path, groups)
+        self.assertEqual(revised[0][0][9]["s"], 26.2)
+        self.assertEqual(revised[1][0][0]["s"], groups[1][0][0]["s"])
+
+    def test_malformed_timestamps_report_the_sidecar_line(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", start="26 seconds")
+        with self.assertRaisesRegex(ValueError, r"sidecar line 11: timestamp must"):
+            app.apply_timing_sidecar(path, groups)
+
+    def test_overlapping_or_reversed_intervals_are_rejected(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", start="00:00:24.000")
+        with self.assertRaisesRegex(ValueError, r"sidecar line 11: start overlaps"):
+            app.apply_timing_sidecar(path, groups)
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", start="00:00:27.350",
+                            end="00:00:27.350")
+        with self.assertRaisesRegex(ValueError, r"sidecar line 11: end must be after start"):
+            app.apply_timing_sidecar(path, groups)
+
+    def test_stale_mismatched_sidecar_is_rejected(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        self.replace_timing(path, "trivia", replacement_text="Trivia")
+        with self.assertRaisesRegex(ValueError, r"sidecar line 11: text does not match"):
+            app.apply_timing_sidecar(path, groups)
+
+    def test_missing_or_duplicate_ids_are_rejected(self):
+        groups = self.trivia_groups()
+        path = self.sidecar_path(groups)
+        rows = path.read_text(encoding="utf-8").splitlines()
+        path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"sidecar is missing line_id 2 word_id 3"):
+            app.apply_timing_sidecar(path, groups)
+        path = self.sidecar_path(groups)
+        rows = path.read_text(encoding="utf-8").splitlines()
+        path.write_text("\n".join(rows + [rows[1]]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"duplicate line_id 1 word_id 1"):
+            app.apply_timing_sidecar(path, groups)
+
+    def test_absolute_centisecond_rounding_is_local_and_deterministic(self):
+        groups = [[[{"w": "A", "s": 1.005, "e": 1.015},
+                    {"w": "B", "s": 1.025, "e": 2.035}]]]
+        path = self.sidecar_path(groups)
+        revised = app.apply_timing_sidecar(path, groups)
+        ass, _ = app.build_karaoke_ass([], timing_groups=revised)
+        dialogue = next(line for line in ass.splitlines() if line.startswith("Dialogue:"))
+        self.assertIn("0:00:00.83", dialogue)
+        self.assertIn("{\\kf18}", dialogue)
+        self.assertIn("{\\kf1}A{\\kf1} {\\kf101}B", dialogue)
+
+    def test_existing_ass_converts_to_tsv_and_back_with_an_edited_gap(self):
+        source = (Path(__file__).parent / "alignment samples" /
+                  "timing_sidecar_trivia.ass").read_text(encoding="utf-8")
+        groups = app.karaoke_groups_from_ass(source)
+        self.assertEqual([item["w"] for item in groups[0][0]][:2], ["It’s", "time"])
+        self.assertEqual(groups[0][0][-1]["s"], 26.13)
+        sidecar = app.timing_sidecar_text(groups).replace(
+            "00:00:26.130\t00:00:27.350\ttrivia",
+            "00:00:26.000\t00:00:27.350\ttrivia")
+        revised = app.apply_timing_sidecar_text(sidecar, groups)
+        rendered = app.render_ass_timing_sidecar(source, revised)
+        self.assertIn("Dialogue: 0,0:00:20.43,0:00:27.79,Now", rendered)
+        self.assertIn("{\\kf114}design!{\\kf169} {\\kf135}trivia", rendered)
+
+    def test_in_progress_review_converts_and_saves_a_timing_override(self):
+        source = app.ASS_HEAD.format(font="Helvetica", size=56, hi="&H00A6D322",
+                                     lo="&H00C8C8C8", margin=56, vmargin=734) + \
+            (Path(__file__).parent / "alignment samples" /
+             "timing_sidecar_trivia.ass").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            generated = Path(directory) / "song.ass"
+            override = Path(directory) / "song.edited.ass"
+            generated.write_text(source, encoding="utf-8")
+            job = {"subtitle_generated_path": str(generated),
+                   "subtitle_override_path": str(override)}
+            sidecar, path, edited = app.subtitle_timing_text(job)
+            self.assertFalse(edited)
+            self.assertEqual(path.name, "song.timings.tsv")
+            changed = sidecar.replace("00:00:26.130\t00:00:27.350\ttrivia",
+                                      "00:00:26.000\t00:00:27.350\ttrivia")
+            self.assertEqual(app.save_subtitle_timing_text(job, changed), 10)
+            self.assertIn("{\\kf169} {\\kf135}trivia",
+                          override.read_text(encoding="utf-8"))
+
+
+class DisplayLyricsTests(unittest.TestCase):
+    def test_email_pair_and_validation(self):
+        body = ("===LYRICS===\n[Verse]\nTake the G-MAT and S-A-T\n"
+                "===DISPLAY LYRICS===\n[Verse]\nTake the GMAT and SAT")
+        form = app.parse_request("Exams", body)
+        self.assertIn("G-MAT", form["lyrics"])
+        self.assertIn("GMAT", form["display_lyrics"])
+        app.validate_display_lyrics(form["lyrics"], form["display_lyrics"])
+        with self.assertRaisesRegex(ValueError, "same sections and lines"):
+            app.validate_display_lyrics(form["lyrics"], "[Verse]\nTake the GMAT and SAT\nExtra")
+        with self.assertRaisesRegex(ValueError, "same sung letters"):
+            app.validate_display_lyrics(form["lyrics"], "[Verse]\nTake the GMAT and ACT")
+        self.assertIsNone(app.parse_request("Old", "===LYRICS===\nHello")["display_lyrics"])
+        with self.assertRaisesRegex(ValueError, "block is empty"):
+            app.validate_display_lyrics(form["lyrics"], "")
+        before = len(app.JOBS)
+        with self.assertRaisesRegex(ValueError, "same sung letters"):
+            app.start_job({**form, "display_lyrics": "[Verse]\nTake the GMAT and ACT"})
+        self.assertEqual(len(app.JOBS), before)
+
+    def test_split_acronyms_become_single_timed_highlights(self):
+        spoken = "[Verse]\nTake the G-MAT and S-A-T today"
+        shown = "[Verse]\nTake the GMAT and SAT today"
+        words = timed_lines(["Take the G-MAT and S-A-T today"], {0: "[Verse]"},
+                            split={"G-MAT": ["G", "MAT"],
+                                   "S-A-T": ["S", "A", "T"]})
+        groups = app.karaoke_groups(words, spoken, display_lyrics=shown)
+        items = groups[0][0]
+        self.assertEqual([item["w"] for item in items],
+                         ["Take", "the", "GMAT", "and", "SAT", "today"])
+        self.assertEqual((items[2]["s"], items[2]["e"]), (words[2]["startS"], words[3]["endS"]))
+        self.assertEqual((items[4]["s"], items[4]["e"]), (words[5]["startS"], words[7]["endS"]))
+        self.assertIn("\tGMAT", app.timing_sidecar_text(groups))
+        ass, count = app.build_karaoke_ass(words, lyrics_text=spoken,
+                                           display_lyrics=shown)
+        self.assertEqual(count, 1)
+        self.assertIn("GMAT", ass)
+        self.assertNotIn("G-MAT", ass)
+
+    def test_uncertain_line_uses_local_display_fallback(self):
+        groups = [[[{"w": "Gee", "s": 1.0, "e": 1.3},
+                    {"w": "Mat", "s": 1.4, "e": 1.8}]],
+                  [[{"w": "Next", "s": 2.0, "e": 2.4}]]]
+        diagnostics = {"lines": [
+            {"section_index": 0, "line_index": 0, "start": 1.0, "end": 1.8},
+            {"section_index": 0, "line_index": 1, "start": 2.0, "end": 2.4}]}
+        warnings = []
+        shown = app.display_karaoke_groups(groups, "G-MAT\nNext", "GMAT\nNext",
+                                            diagnostics, warnings)
+        self.assertEqual(shown[0][0][0]["w"], "GMAT")
+        self.assertEqual(shown[1], groups[1])
+        self.assertEqual(len(warnings), 1)
+
+    def test_stable_ts_keeps_original_display_line_indices(self):
+        display = "[Verse]\nGMAT first\nSAT second\nFinal line"
+        hybrid = {"lines": [{"hidden": False}, {"hidden": True}, {"hidden": False}]}
+        self.assertEqual(app.safe_display_lyrics(display, hybrid), "GMAT first\nFinal line")
 
 
 if __name__ == "__main__":

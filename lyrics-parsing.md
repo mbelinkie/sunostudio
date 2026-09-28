@@ -45,6 +45,30 @@ the design and historical failure modes reviewable.
 *line breaks*. The submitted lyrics give perfect line breaks but no timing.
 So the two are aligned against each other, and the email's line breaks win.
 
+### Two lyric spellings in a Rovo email
+
+Rovo may send an optional second lyric block when Suno needs pronunciation
+spelling that should not appear in the video:
+
+```text
+===LYRICS===
+[Verse]
+Take the G-MAT and S-A-T today
+
+===DISPLAY LYRICS===
+[Verse]
+Take the GMAT and SAT today
+```
+
+`LYRICS` is sent to Suno and used for word alignment. `DISPLAY LYRICS` is
+used only after timing is known. Keep the same section tags, nonempty lyric
+lines, and sung letters in the same order; change only spelling, separators,
+case, or punctuation. A mismatch is shown in the inbox and blocks generation
+before Suno is called. Without the second block, existing behavior applies.
+An acronym timed as several Suno words becomes one displayed karaoke word
+spanning those timings. If a line cannot be mapped safely, the full display
+line receives one highlight and the subtitle doctor reports it.
+
 ---
 
 ## Stage 1 — Email body to fields
@@ -740,6 +764,48 @@ lyrics or from the fallback heuristic.
 python3 subs_doctor.py "/path/to/song.mp3"
 python3 subs_doctor.py song.mp3 --no-frames     # timeline only, instant
 ```
+
+## Manual timing review
+
+### Word-timing TSV sidecar
+
+After the normal word alignment, Suno Studio writes `<song>.timings.tsv` next
+to the generated `.ass`. It is the preferred way to correct a single karaoke
+word: it has stable 1-based `line_id` and `word_id`, absolute millisecond
+timestamps, and the exact Unicode text that will be rendered.
+
+```tsv
+line_id	word_id	start	end	text
+4	9	00:00:23.170	00:00:24.310	design!
+4	10	00:00:26.000	00:00:27.350	trivia
+```
+
+Edit only the timestamp(s) you intend to change, preserving the header, IDs,
+and text. The next video render automatically validates and applies that file
+before the existing ASS renderer runs. `subs_doctor.py` also supports the same
+workflow without rendering a video:
+
+```bash
+python3 subs_doctor.py song.mp3 --export-timings
+# edit song.timings.tsv in a UTF-8 text editor
+python3 subs_doctor.py song.mp3 --apply-timings song.timings.tsv --no-frames
+```
+
+The importer requires `HH:MM:SS.mmm`, every expected ID exactly once, matching
+word text, increasing word intervals, and no overlap within a lyric event. It
+reports the TSV line number for malformed timestamps, stale sidecars, duplicate
+IDs, and invalid intervals. Absolute timestamps are converted to ASS
+centiseconds locally, so changing one word's start changes its preceding gap
+without moving later word starts or later lyric sections.
+
+When **Video approval** is enabled, the **Word Timing Editor** opens that TSV
+directly for an in-progress video. Older waiting videos with only an ASS file
+are converted when the editor first opens. Saving validates the TSV and writes
+an internal `<song>.edited.ass` override, preserving the original dialogue
+boundaries, fades, colours, and renderer. **Regenerate With Timing Edits**
+reuses the saved audio, artwork, and render settings; it does not call Suno,
+re-align lyrics, or regenerate art. The prior preview is retained until a newer
+subtitle revision is approved.
 
 ## Local stable-ts hybrid (4.14)
 

@@ -16,16 +16,21 @@ NOT next to this script - so the script is safe to share or commit.
 import email
 import email.header
 import email.utils
+import email.parser
+from email.message import EmailMessage
+import csv
 import colorsys
 import hashlib
 import http.server
 import imaplib
 import json
+import math
 import mimetypes
 import os
 import platform
 import re
 import signal
+import smtplib
 import socketserver
 import ssl
 import subprocess
@@ -39,10 +44,10 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "4.24"
+APP_VERSION = "6.0"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -64,6 +69,7 @@ DEFAULT_CONFIG = {
     "watch_enabled": False,
     "gmail_user": "",
     "gmail_app_password": "",           # 16-char app password, NOT your real password
+    "slack_bot_token": "",              # optional bot token for local file delivery
     "gmail_label": "SunoStudio",
     "watch_seconds": 60,
     "default_style": "",
@@ -104,6 +110,7 @@ DEFAULT_CONFIG = {
     "reject_purge_days": 14,
     "art_title": True,                  # let the artwork carry the title
     "video_crf": 24,                    # lower = better quality, bigger file
+    "render_backend": "local",         # "local" | "aws"; opt in after AWS setup
 }
 
 # Prompt assembly stays in code.  These values are deliberately English-only
@@ -196,6 +203,27 @@ def atomic_write_json(path, value, mode=None):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(value, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def atomic_write_text(path, value, mode=None):
+    """Write text beside its destination, then replace it atomically."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(value)
             f.flush()
             os.fsync(f.fileno())
         if mode is not None:
@@ -853,6 +881,381 @@ def move_to_final(source, job_id, recipient=""):
     return str(dest)
 
 
+class SlackDeliveryError(RuntimeError):
+    """A Slack error with an explicit signal for possibly completed uploads."""
+    def __init__(self, message, uncertain=False):
+        super().__init__(message)
+        self.uncertain = bool(uncertain)
+
+
+def aws_settings():
+    """Read resource IDs saved by setup_aws.py; importing AWS stays optional."""
+    return {
+        "profile": CONFIG.get("aws_profile"),
+        "region": CONFIG.get("aws_region"), "bucket": CONFIG.get("aws_bucket"),
+        "cluster": CONFIG.get("aws_cluster"),
+        "render_task": CONFIG.get("aws_render_task"),
+        "delivery_task": CONFIG.get("aws_delivery_task"),
+        "subnets": CONFIG.get("aws_subnets"),
+        "security_group": CONFIG.get("aws_security_group"),
+        "link_url": CONFIG.get("aws_link_url"),
+        "link_secret": CONFIG.get("aws_link_secret"),
+    }
+
+
+def aws_ready():
+    try:
+        import aws_render
+        import boto3  # noqa: F401
+        aws_render._config(aws_settings())
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
+def email_link_for_job(job):
+    import aws_render
+    return aws_render.email_link_for_file(aws_settings(), job["id"], job["final_path"])
+
+
+def cloud_slack_for_job(job):
+    """Dispatch once; an uncertain completion must be reviewed before retry."""
+    import aws_render
+    config = aws_settings()
+    render_attempt = job.get("cloud_revision_execution") or job.get("cloud_execution") or {}
+    render_result = render_attempt.get("result") or {}
+    cloud_video = (render_result.get("output_uri")
+                   if render_attempt.get("status") == "succeeded" else None)
+    execution = job.get("cloud_delivery")
+    if not execution:
+        attempt = uuid.uuid4().hex
+        set_job(job["id"], cloud_delivery={"attempt_id": attempt, "status": "dispatching",
+                "result_uri": f"s3://{config['bucket']}/delivery-results/{job['id']}/{attempt}/result.json"})
+        try:
+            execution = aws_render.dispatch_slack_delivery(
+                config, job["id"], attempt, cloud_video or job["final_path"],
+                job["delivery_destination"])
+        except Exception as error:
+            execution = aws_render.reconcile_render(config, {
+                "attempt_id": attempt,
+                "result_uri": f"s3://{config['bucket']}/delivery-results/{job['id']}/{attempt}/result.json"})
+            if not execution.get("task_arn") and not execution.get("result"):
+                raise SlackDeliveryError(
+                    "AWS Slack dispatch is unconfirmed; inspect the saved attempt before retrying.",
+                    uncertain=True) from error
+        set_job(job["id"], cloud_delivery=execution)
+    else:
+        execution = aws_render.reconcile_render(config, execution)
+        set_job(job["id"], cloud_delivery=execution)
+        if not execution.get("task_arn") and not execution.get("result"):
+            raise SlackDeliveryError("Cloud delivery dispatch is unconfirmed; review AWS before retrying.", uncertain=True)
+    if execution.get("status") == "succeeded":
+        result = execution.get("result") or {}
+        return {"provider": "slack", "file_id": result.get("file_id"),
+                "channel_id": result.get("channel_id"),
+                "permalink": (result.get("slack_file") or {}).get("permalink", "")}
+    while True:
+        state = aws_render.wait_or_poll_render(config, execution, wait_seconds=15)
+        set_job(job["id"], cloud_delivery=state)
+        if state["status"] == "running":
+            continue
+        result = state.get("result") or {}
+        if state["status"] == "succeeded":
+            return {"provider": "slack", "file_id": result.get("file_id"),
+                    "channel_id": result.get("channel_id"),
+                    "permalink": (result.get("slack_file") or {}).get("permalink", "")}
+        raise SlackDeliveryError(result.get("error") or "Cloud Slack delivery failed",
+                                 uncertain=state["status"] in ("uncertain", "failed"))
+
+
+EMAIL_LINK_FACTORY = email_link_for_job
+CLOUD_DELIVERY_DISPATCHER = cloud_slack_for_job
+
+_DELIVERY_LOCKS = {}
+_DELIVERY_LOCKS_GUARD = threading.Lock()
+DELIVERY_EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+SLACK_CHANNEL_RE = re.compile(r"^C[A-Z0-9]+$")
+
+
+def valid_delivery_email(value):
+    """Return one validated mailbox from an address or a display-name form."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        addresses = email.utils.getaddresses([raw])
+    except (TypeError, ValueError):
+        return ""
+    if len(addresses) != 1:
+        return ""
+    address = (addresses[0][1] or "").strip()
+    if not DELIVERY_EMAIL_RE.fullmatch(address):
+        return ""
+    return address.lower()
+
+
+def delivery_details(fields):
+    """Resolve explicit delivery choice and return (mode, destination, error)."""
+    fields = fields if isinstance(fields, dict) else {}
+    raw_mode = fields.get("delivery_mode")
+    mode = str(raw_mode if raw_mode is not None else "none").strip().lower()
+    if not mode or mode in {"no", "no delivery", "off"}:
+        mode = "none"
+    if mode not in {"none", "slack", "email"}:
+        return mode, "", "Choose Slack, Email, or None for delivery."
+    if mode == "none":
+        return mode, "", ""
+    if mode == "email":
+        raw = fields.get("recipient") or fields.get("delivery_destination") or ""
+        destination = valid_delivery_email(raw)
+        if not destination:
+            return mode, "", "Enter a valid recipient email address, or choose None."
+        return mode, destination, ""
+    raw = str(fields.get("slack_channel_id") or fields.get("delivery_destination") or "").strip()
+    if not SLACK_CHANNEL_RE.fullmatch(raw):
+        return mode, "", "Enter a Slack channel ID beginning with C, or choose None."
+    return mode, raw, ""
+
+
+def normalize_delivery_fields(fields):
+    """Copy a request form while preserving its explicit delivery selection."""
+    result = dict(fields or {})
+    mode, destination, error = delivery_details(result)
+    result["delivery_mode"] = mode
+    raw_recipient = str(result.get("recipient") or "").strip()
+    result["recipient"] = valid_delivery_email(raw_recipient) or raw_recipient
+    result["slack_channel_id"] = str(result.get("slack_channel_id") or "").strip()
+    result["delivery_destination"] = destination
+    if error:
+        result["delivery_error"] = error
+    else:
+        result.pop("delivery_error", None)
+    return result
+
+
+def _delivery_lock(job_id):
+    with _DELIVERY_LOCKS_GUARD:
+        return _DELIVERY_LOCKS.setdefault(job_id, threading.Lock())
+
+
+def slack_api_post(method, token, payload, uncertain_on_transport=False):
+    request = urllib.request.Request(
+        "https://slack.com/api/" + method,
+        data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + token,
+                 "Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        raise SlackDeliveryError(f"Slack {method} request failed: {error}",
+                                 uncertain=uncertain_on_transport) from error
+    if result.get("ok") is not True:
+        raise SlackDeliveryError(
+            f"Slack {method} failed: {result.get('error', 'unknown response')}",
+            uncertain=uncertain_on_transport and "ok" not in result)
+    return result
+
+
+def slack_upload_mp4(video_path, channel_id, token):
+    """Upload one MP4 with Slack's external-file upload flow."""
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        raise RuntimeError("the finished MP4 is missing")
+    if not token:
+        raise RuntimeError("Add a Slack bot token in Settings before sending to Slack.")
+    size = video_path.stat().st_size
+    filename = video_path.name
+    slot = slack_api_post("files.getUploadURLExternal", token,
+                          {"filename": filename, "length": size})
+    file_id, upload_url = slot.get("file_id"), slot.get("upload_url")
+    if not file_id or not upload_url:
+        raise SlackDeliveryError("Slack did not return an upload URL and file ID.")
+
+    boundary = "suno-studio-" + uuid.uuid4().hex
+    safe_filename = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    data = video_path.read_bytes()
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+    body += data + f"\r\n--{boundary}--\r\n".encode("ascii")
+    request = urllib.request.Request(
+        upload_url, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(f"Slack upload returned HTTP {response.status}")
+    except Exception as error:
+        # The upload URL alone does not share a file to the channel; completion
+        # is a separate API call, so retrying cannot duplicate a channel post.
+        code = getattr(error, "code", None)
+        detail = f"HTTP {code}" if code else "network or server error"
+        raise SlackDeliveryError(f"Slack file upload failed ({detail}).") from error
+
+    complete = slack_api_post(
+        "files.completeUploadExternal", token,
+        {"files": [{"id": file_id, "title": filename}],
+         "channel_id": channel_id,
+         "initial_comment": f"Video: {filename}"},
+        uncertain_on_transport=True)
+    file_info = (complete.get("files") or [{}])[0]
+    return {"provider": "slack", "file_id": file_id,
+            "channel_id": channel_id, "title": filename,
+            "permalink": file_info.get("permalink") or ""}
+
+
+def send_email_delivery(job):
+    fields = job.get("current_fields") or {}
+    recipient = job.get("delivery_destination") or delivery_details(fields)[1]
+    user = (CONFIG.get("gmail_user") or "").strip()
+    password = (CONFIG.get("gmail_app_password") or "").strip()
+    if not user or not password:
+        raise RuntimeError("Add your Gmail address and app password in Settings before sending email.")
+    if not callable(EMAIL_LINK_FACTORY):
+        raise RuntimeError("Private email links need AWS setup. The local MP4 is still saved.")
+    signed = EMAIL_LINK_FACTORY(job)
+    url = signed.get("url") if isinstance(signed, dict) else signed
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise RuntimeError("The private download link could not be created.")
+    message = EmailMessage()
+    message["Subject"] = f"Your video: {job.get('title') or 'Suno Studio'}"
+    message["From"] = user
+    message["To"] = recipient
+    message["Message-ID"] = email.utils.make_msgid()
+    message.set_content(
+        "Your approved Suno Studio video is ready.\n\n"
+        f"Download it privately here: {url}\n\n"
+        "This link expires in three days. Your local MP4 remains available in Suno Studio.")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465,
+                          context=ssl.create_default_context(), timeout=45) as smtp:
+        smtp.login(user, password)
+        refused = smtp.send_message(message)
+    if refused:
+        raise RuntimeError("Gmail refused delivery to: " + ", ".join(sorted(refused)))
+    return {"provider": "gmail-smtp", "message_id": message["Message-ID"],
+            "recipient": recipient,
+            "sent_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")}
+
+
+def send_job_delivery(job_id, allow_uncertain_retry=False):
+    """Send only an approved, published MP4 and store outcome apart from render state."""
+    lock = _delivery_lock(job_id)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        job = job_snapshot(job_id)
+        if not job or job.get("status") != "completed" or not job.get("final_path"):
+            set_job(job_id, delivery_status="error",
+                    delivery_error="The approved local MP4 is not available for delivery.")
+            return
+        if job.get("delivery_status") == "sent":
+            return
+        if job.get("delivery_status") == "needs_review" and not allow_uncertain_retry:
+            return
+        fields = job.get("current_fields") or {}
+        mode, destination, error = delivery_details(fields)
+        if error:
+            set_job(job_id, delivery_mode=mode, delivery_destination=destination,
+                    delivery_status="error", delivery_error=error)
+            return
+        if mode == "none":
+            set_job(job_id, delivery_mode=mode, delivery_destination="",
+                    delivery_status="not_requested", delivery_error="", delivery_receipt=None)
+            return
+        if not Path(job["final_path"]).is_file():
+            raise RuntimeError("the finished MP4 is missing from its saved location")
+        set_job(job_id, delivery_mode=mode, delivery_destination=destination,
+                delivery_status="sending", delivery_error="", delivery_receipt=None,
+                delivery_attempts=int(job.get("delivery_attempts") or 0) + 1)
+        job = job_snapshot(job_id)
+        job["delivery_mode"] = mode
+        job["delivery_destination"] = destination
+        if mode == "email":
+            receipt = send_email_delivery(job)
+        elif job.get("render_backend") == "aws":
+            if not callable(CLOUD_DELIVERY_DISPATCHER):
+                raise RuntimeError("Cloud Slack delivery is not connected in this app build.")
+            receipt = CLOUD_DELIVERY_DISPATCHER(job)
+        else:
+            receipt = slack_upload_mp4(
+                job["final_path"], destination,
+                (CONFIG.get("slack_bot_token") or "").strip())
+        set_job(job_id, delivery_status="sent", delivery_error="",
+                delivery_receipt=receipt or {"provider": mode},
+                delivered_at=time.time())
+    except SlackDeliveryError as error:
+        set_job(job_id, delivery_status="needs_review" if error.uncertain else "error",
+                delivery_error=str(error), delivery_receipt=None)
+    except Exception as error:
+        set_job(job_id, delivery_status="error", delivery_error=str(error),
+                delivery_receipt=None)
+    finally:
+        lock.release()
+
+
+def queue_delivery(job_id, allow_uncertain_retry=False):
+    """Queue one send attempt; duplicate UI clicks cannot launch another send."""
+    job = job_snapshot(job_id)
+    if not job or job.get("status") != "completed" or not job.get("final_path"):
+        raise RuntimeError("delivery is available after the approved video is published")
+    status = job.get("delivery_status") or "not_requested"
+    if status == "sent":
+        return False
+    if status in {"queued", "sending"}:
+        return False
+    fields = job.get("current_fields") or {}
+    mode, destination, error = delivery_details(fields)
+    if error:
+        set_job(job_id, delivery_mode=mode, delivery_destination=destination,
+                delivery_status="error", delivery_error=error)
+        return False
+    if mode == "none":
+        set_job(job_id, delivery_mode="none", delivery_destination="",
+                delivery_status="not_requested", delivery_error="", delivery_receipt=None)
+        return False
+    if status == "needs_review" and not allow_uncertain_retry:
+        detail = ("the Slack file may already have reached its channel" if mode == "slack"
+                  else "the email may already have been sent")
+        raise RuntimeError(f"Review the interrupted delivery before retrying; {detail}.")
+    if mode == "slack" and job.get("render_backend") == "aws" and job.get("cloud_delivery"):
+        import aws_render
+        attempt = job["cloud_delivery"]
+        state = aws_render.wait_or_poll_render(aws_settings(), attempt, wait_seconds=0)
+        if state["status"] in ("running", "dispatching") and not state.get("task_arn"):
+            state = aws_render.reconcile_render(aws_settings(), state)
+        if state["status"] in ("running", "dispatching") and not state.get("task_arn") and not state.get("result"):
+            if not allow_uncertain_retry:
+                set_job(job_id, delivery_status="needs_review",
+                        delivery_error="AWS dispatch is unconfirmed; inspect the saved attempt before retrying.")
+                return False
+            set_job(job_id, cloud_delivery=None)
+        elif state["status"] in ("failed", "uncertain"):
+            if not allow_uncertain_retry:
+                set_job(job_id, cloud_delivery=state, delivery_status="needs_review",
+                        delivery_error="AWS Slack delivery may have completed; check the channel before retrying.")
+                return False
+            set_job(job_id, cloud_delivery=None)
+        elif state["status"] == "succeeded":
+            result = state.get("result") or {}
+            set_job(job_id, cloud_delivery=state, delivery_status="sent", delivery_error="",
+                    delivery_receipt={"provider": "slack", "file_id": result.get("file_id"),
+                                      "channel_id": result.get("channel_id"),
+                                      "permalink": (result.get("slack_file") or {}).get("permalink", "")},
+                    delivered_at=time.time())
+            return False
+        else:
+            set_job(job_id, cloud_delivery=state)
+    set_job(job_id, delivery_mode=mode, delivery_destination=destination,
+            delivery_status="queued", delivery_error="", delivery_receipt=None)
+    threading.Thread(target=send_job_delivery,
+                     args=(job_id, allow_uncertain_retry), daemon=True).start()
+    return True
+
+
 def reject_job_staging(job_id, reason="cancelled"):
     job = job_snapshot(job_id)
     root = Path(job.get("staging_folder") or job.get("folder") or "")
@@ -886,8 +1289,9 @@ def finalize_pipeline_job(job_id):
     video = job.get("video_path") or job.get("output_path")
     if not video or not Path(video).is_file():
         raise RuntimeError("the completed staging video is missing")
-    fields = dict(job.get("current_fields") or JOB_FORMS.get(job_id) or {})
-    recipient = first_email(fields.get("recipient") or "")
+    fields = normalize_delivery_fields(job.get("current_fields") or JOB_FORMS.get(job_id) or {})
+    delivery_mode, delivery_destination, delivery_error = delivery_details(fields)
+    recipient = delivery_destination if delivery_mode == "email" and not delivery_error else ""
     published = move_to_final(video, job_id, recipient)
     # Unselected choices remain recoverable; selected intermediate work is
     # ordinary successful staging and is removed with the job folder.
@@ -904,10 +1308,17 @@ def finalize_pipeline_job(job_id):
             print(f"[pipeline] could not remove completed staging folder: {e}")
     delivery_note = f" for delivery to {recipient}" if recipient else ""
     set_job(job_id, status="completed", stage="done", message="published to Final" + delivery_note,
-            final_path=published, tracks=[{"file": published, "name": Path(published).name, "video": True}])
+            final_path=published, current_fields=fields,
+            delivery_mode=delivery_mode, delivery_destination=delivery_destination,
+            delivery_status=("not_requested" if delivery_mode == "none" else
+                             "error" if delivery_error else "awaiting_approval"),
+            delivery_error=delivery_error, delivery_receipt=None,
+            tracks=[{"file": published, "name": Path(published).name, "video": True}])
     with JOBS_LOCK:
         JOB_FORMS.pop(job_id, None)
         _save_jobs_locked()
+    if delivery_mode != "none" and not delivery_error:
+        queue_delivery(job_id)
 
 
 def run_image_stage(job_id, prompt_override=None):
@@ -969,6 +1380,63 @@ def run_image_stage(job_id, prompt_override=None):
         _clear_request_context()
 
 
+def uploaded_image_suffix(data):
+    """Identify upload formats the local FFmpeg renderer can reliably consume."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def add_uploaded_image(job_id, filename, data):
+    """Add a validated local image as an artwork choice for a paused song."""
+    job = job_snapshot(job_id)
+    if not job or not job.get("pipeline"):
+        raise RuntimeError("that pipeline job no longer exists")
+    if job.get("status") != "paused_song":
+        raise RuntimeError("an image can be uploaded while the job is waiting for song approval")
+    if job.get("stale_song"):
+        raise RuntimeError("lyrics or genre changed; resubmit to Suno before adding artwork")
+    song = selected_variant(job, "song_variants", "selected_song")
+    if not song:
+        raise RuntimeError("select a song variant before uploading artwork")
+    suffix = uploaded_image_suffix(data)
+    if not suffix:
+        raise RuntimeError("upload a PNG, JPEG, or WebP image")
+    ff = find_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg is required to validate uploaded artwork")
+
+    root = Path(job.get("staging_folder") or pipeline_root("staging") / job_id)
+    folder = allocate_unique_dir(root / "image-upload")
+    image = folder / ("art" + suffix)
+    try:
+        image.write_bytes(data)
+        image_dimensions(ff, image)
+    except Exception:
+        try:
+            image.unlink(missing_ok=True)
+            folder.rmdir()
+        except OSError:
+            pass
+        raise
+
+    form = dict(job.get("current_fields") or JOB_FORMS.get(job_id) or {})
+    label = Path(filename or "uploaded image").name[:120]
+    variant = {"id": uuid.uuid4().hex, "file": str(image), "created": time.time(),
+               "prompt": "", "inputs": form, "song_variant": song.get("id"),
+               "source": "upload", "name": label}
+    variants = list(job.get("image_variants") or []) + [variant]
+    # Uploaded artwork is deliberately held for the same visible image review
+    # used by generated variants; it never starts a video behind the operator's back.
+    set_job(job_id, image_variants=variants, selected_image=variant["id"],
+            image_regenerations=max(0, len(variants) - 1), status="paused_image",
+            stage="image", message="uploaded image ready for approval")
+
+
 def start_pipeline_video(job_id):
     job = job_snapshot(job_id)
     song = selected_variant(job, "song_variants", "selected_song")
@@ -988,7 +1456,7 @@ def start_pipeline_video(job_id):
     # renderer must never substitute freshly generated art for a gated image.
     set_job(job_id, status="queued", stage="video", message="queued for video rendering",
             video_song_id=song.get("id"), video_image_id=image.get("id"),
-            video_image_file=str(image_file))
+            video_image_file=str(image_file), cloud_execution=None)
     threading.Thread(target=run_video_job, args=(job_id, track), daemon=True).start()
 
 
@@ -1001,7 +1469,8 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
     if fields:
         current.update({k: v for k, v in fields.items() if k in {
             "title", "tagline", "style", "lyrics", "infographic", "model", "instrumental",
-            "negativeTags", "recipient", "vocalGender", "styleWeight", "weirdnessConstraint"}})
+            "negativeTags", "recipient", "delivery_mode", "slack_channel_id",
+            "vocalGender", "styleWeight", "weirdnessConstraint"}})
         stale = (current.get("lyrics") != (job.get("current_fields") or {}).get("lyrics") or
                  current.get("style") != (job.get("current_fields") or {}).get("style"))
         set_job(job_id, current_fields=current, title=(current.get("title") or "Untitled"),
@@ -1025,6 +1494,7 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
         set_job(job_id, status="interrupted", message="interrupted; restarting may be billed again")
     elif action == "resubmit_song":
         form = dict(job.get("current_fields") or {})
+        validate_display_lyrics(form.get("lyrics", ""), form.get("display_lyrics"))
         JOB_CANCELS[job_id] = threading.Event()
         set_job(job_id, status="queued", stage="song", stale_song=False, task_id="",
                 message="resubmitting song")
@@ -1053,14 +1523,41 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
             raise RuntimeError("lyrics or genre changed; generate a new song before rendering video")
         JOB_CANCELS[job_id] = threading.Event()
         start_pipeline_video(job_id)
+    elif action == "retry_video":
+        if job.get("status") != "error" or job.get("stage") != "video":
+            raise RuntimeError("video retry is available after a failed video stage")
+        JOB_CANCELS[job_id] = threading.Event()
+        execution = job.get("cloud_execution")
+        if execution:
+            import aws_render
+            state = aws_render.wait_or_poll_render(aws_settings(), execution, wait_seconds=0)
+            if state["status"] in ("running", "dispatching") and not state.get("task_arn"):
+                state = aws_render.reconcile_render(aws_settings(), state)
+            if state["status"] in ("running", "dispatching") and not state.get("task_arn") and not state.get("result"):
+                raise RuntimeError("AWS attempt is unconfirmed; inspect ECS before starting another paid render")
+            if state["status"] in ("running", "succeeded"):
+                song = selected_variant(job, "song_variants", "selected_song")
+                image = selected_variant(job, "image_variants", "selected_image")
+                track = dict(song.get("track") or {}) if song else {}
+                track["file"] = song.get("file") if song else ""
+                track["pipeline_image"] = image.get("file") if image else ""
+                set_job(job_id, cloud_execution=state, status="queued", stage="video")
+                threading.Thread(target=run_video_job, args=(job_id, track, True), daemon=True).start()
+                return
+        start_pipeline_video(job_id)
+    elif action == "rerender_subtitles":
+        start_subtitle_rerender(job_id)
     elif action == "approve_video":
-        recipient = first_email(current.get("recipient") or "")
-        if (current.get("recipient") or "").strip() and not recipient:
-            raise RuntimeError("enter a valid delivery email, or clear the field to publish without delivery routing")
-        if recipient != (current.get("recipient") or ""):
-            current["recipient"] = recipient
-            set_job(job_id, current_fields=current)
+        current = normalize_delivery_fields(current)
+        set_job(job_id, current_fields=current)
         finalize_pipeline_job(job_id)
+    elif action == "retry_delivery":
+        if job.get("status") != "completed" or not job.get("final_path"):
+            raise RuntimeError("delivery can be retried after the approved video is published")
+        allow_uncertain_retry = bool((fields or {}).get("confirm_uncertain_delivery"))
+        current = normalize_delivery_fields(current)
+        set_job(job_id, current_fields=current)
+        queue_delivery(job_id, allow_uncertain_retry=allow_uncertain_retry)
     elif action in ("back_image", "back_song"):
         if job.get("video_path"):
             reject_path(job_id, job["video_path"], "superseded video")
@@ -1087,12 +1584,14 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
 
 def start_job(form, source="manual"):
     """Register a job and kick off its worker thread. Returns the job id."""
-    form = dict(form)
+    form = normalize_delivery_fields(form)
+    validate_display_lyrics(form.get("lyrics", ""), form.get("display_lyrics"))
     if not (form.get("style") or "").strip() and (CONFIG.get("default_style") or "").strip():
         form["style"] = CONFIG["default_style"].strip()
     job_id = uuid.uuid4().hex
     provider_name = CONFIG.get("provider") or "kie"
     staging_folder = pipeline_root("staging") / job_id
+    delivery_mode, delivery_destination, delivery_error = delivery_details(form)
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id,
@@ -1114,6 +1613,13 @@ def start_job(form, source="manual"):
             "selected_image": None, "image_regenerations": 0,
             "stale_song": False, "stage": "song",
             "pipeline": True, "staging_folder": str(staging_folder),
+            "delivery_mode": delivery_mode,
+            "delivery_destination": delivery_destination,
+            "delivery_status": "not_requested" if delivery_mode == "none" else "awaiting_approval",
+            "delivery_error": delivery_error,
+            "delivery_receipt": None,
+            "delivery_attempts": 0,
+            "render_backend": CONFIG.get("render_backend", "local"),
         }
         JOB_FORMS[job_id] = dict(form)
         _save_jobs_locked()
@@ -1149,6 +1655,7 @@ def run_job(job_id, form):
             if JOB_CANCELS.setdefault(job_id, threading.Event()).is_set():
                 set_job(job_id, status="interrupted", message="song generation interrupted")
                 return
+            validate_display_lyrics(form.get("lyrics", ""), form.get("display_lyrics"))
             set_job(job_id, status="submitting")
             log("submitting to " + provider.label)
             task_id = provider.submit(form)
@@ -1230,6 +1737,7 @@ def run_job(job_id, form):
                 try:
                     data = provider.timestamps(task_id, t["suno_id"])
                     data["lyrics"] = form.get("lyrics") or ""
+                    data["display_lyrics"] = form.get("display_lyrics") or ""
                     mp3.with_suffix(".words.json").write_text(json.dumps(data))
                     entry["words"] = len(data["alignedWords"])
                 except Exception as e:
@@ -1249,6 +1757,8 @@ def run_job(job_id, form):
                 f"Date:   {datetime.now():%Y-%m-%d %H:%M}",
                 "", "-" * 40, "", words or "(instrumental)",
             ]
+            if (form.get("display_lyrics") or "").strip():
+                meta.extend(["", "===DISPLAY LYRICS===", form["display_lyrics"].strip()])
             (folder / f"{base}.txt").write_text("\n".join(meta), encoding="utf-8")
 
         variants = [{"id": uuid.uuid4().hex, "file": x["file"], "created": time.time(),
@@ -1285,10 +1795,17 @@ def run_job(job_id, form):
 
 def resume_persisted_jobs():
     """Resume safe generation states without ever double-submitting a task."""
-    generations, videos = [], []
+    generations, videos, subtitle_rerenders = [], [], []
     with JOBS_LOCK:
         for job_id, job in JOBS.items():
             status = job.get("status")
+            if job.get("delivery_status") in ("queued", "sending"):
+                if job.get("delivery_mode") == "slack":
+                    message = ("the Slack send was interrupted and may already have posted; "
+                               "review before retrying")
+                else:
+                    message = ("the email send was interrupted; check delivery before retrying")
+                job.update(delivery_status="needs_review", delivery_error=message)
             if job.get("pipeline"):
                 stage = job.get("stage") or "song"
                 if status in ("paused_song", "paused_image", "paused_video", "completed", "cancelled", "error"):
@@ -1304,6 +1821,9 @@ def resume_persisted_jobs():
                     # operator can explicitly regenerate from this safe pause.
                     job.update(status="paused_image", message="image work interrupted; regenerate when ready")
                 elif stage == "video":
+                    if job.get("subtitle_rerendering"):
+                        subtitle_rerenders.append(job_id)
+                        continue
                     song = selected_variant(job, "song_variants", "selected_song")
                     image = selected_variant(job, "image_variants", "selected_image")
                     if song and image:
@@ -1341,6 +1861,9 @@ def resume_persisted_jobs():
     for job_id, track in videos:
         threading.Thread(target=run_video_job, args=(job_id, track, True),
                          daemon=True).start()
+    for job_id in subtitle_rerenders:
+        threading.Thread(target=run_subtitle_rerender, args=(job_id, True),
+                         daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -1368,6 +1891,8 @@ FONT_HINTS = [
     "/System/Library/Fonts/Geneva.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    str(Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts" / "arial.ttf"),
+    str(Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts" / "segoeui.ttf"),
 ]
 
 # All three stops are mid-tone or brighter. A dark stop used to swallow the
@@ -2521,19 +3046,284 @@ def fit_fontsize(groups, width=1920, margin=56, lo=28, hi=64):
     return max(lo, min(hi, int((width - 2 * margin) / longest / 0.52)))
 
 
+TIMING_TSV_COLUMNS = ("line_id", "word_id", "start", "end", "text")
+TIMING_TSV_TIMESTAMP = re.compile(r"^(\d+):(\d{2}):(\d{2})\.(\d{3})$")
+
+
+def karaoke_groups(aligned, lyrics_text="", aligner_method=None,
+                   display_lyrics="", display_warnings=None):
+    """Return the renderer's existing grouped ``w``/``s``/``e`` words.
+
+    This deliberately keeps the alignment and fallback decision in one place:
+    a timing sidecar changes only timestamps after the selected aligner has
+    chosen the text and event grouping.
+    """
+    alignment = lines_from_lyrics(aligned, lyrics_text, method=aligner_method,
+                                  return_result=True)
+    groups = alignment["groups"]
+    groups = group_lyric_lines(aligned) if groups is None else groups
+    return display_karaoke_groups(groups, lyrics_text, display_lyrics,
+                                  alignment, display_warnings)
+
+
+def display_karaoke_groups(groups, lyrics_text, display_lyrics, alignment=None,
+                           warnings=None):
+    """Replace each timed sung line with its matching display spelling."""
+    if not display_lyrics:
+        return groups
+    spoken = parse_authored_lyrics(lyrics_text)
+    shown = parse_authored_lyrics(display_lyrics)
+    replacements = {(section["index"], line["index"]): (line["text"], display["text"])
+                    for section, display_section in zip(spoken, shown)
+                    for line, display in zip(section["lines"], display_section["lines"])}
+    diagnostics = (alignment or {}).get("lines") or []
+    if diagnostics:
+        matches = []
+        for group in groups:
+            start, end = group[0][0]["s"], group[-1][-1]["e"]
+            matches.append(next((line for line in diagnostics
+                                 if line["start"] is not None and line["end"] is not None
+                                 and abs(line["start"] - start) < 0.03
+                                 and abs(line["end"] - end) < 0.03), None))
+    else:
+        keys = list(replacements)
+        matches = ([{"section_index": key[0], "line_index": key[1]} for key in keys]
+                   if len(keys) == len(groups) else [None] * len(groups))
+
+    result = []
+    for group, line in zip(groups, matches):
+        pair = replacements.get((line["section_index"], line["line_index"])) if line else None
+        if not pair:
+            if warnings is not None:
+                warnings.append("one audio line has no matching display line; kept Suno text")
+            result.append(group)
+            continue
+        if pair[0] == pair[1]:
+            result.append(group)
+            continue
+        items = [item for row in group for item in row]
+        words = pair[1].split()
+        # Most Suno splits preserve the same letters even when punctuation and
+        # token boundaries change (S-A-T -> S, A, T). Match those boundaries.
+        if _chars(join_words([item["w"] for item in items])) == _chars(pair[0]) and all(
+                _chars(word) for word in words + [item["w"] for item in items]):
+            mapped, index = [], 0
+            for word in words:
+                first, length = index, 0
+                while index < len(items) and length < len(_chars(word)):
+                    length += len(_chars(items[index]["w"]))
+                    index += 1
+                if length != len(_chars(word)):
+                    break
+                mapped.append({"w": word, "s": items[first]["s"], "e": items[index - 1]["e"],
+                               "parenthetical": any(it.get("parenthetical") for it in items[first:index])})
+            if len(mapped) == len(words) and index == len(items):
+                result.append([mapped])
+                continue
+        # ponytail: uncertain word boundaries use one whole-line highlight;
+        # add fuzzy token mapping only if real songs need finer timing.
+        result.append([[{"w": pair[1], "s": items[0]["s"], "e": items[-1]["e"]}]])
+        if warnings is not None:
+            warnings.append(f"display line {line['section_index'] + 1}.{line['line_index'] + 1} "
+                            "uses one whole-line highlight")
+    return result
+
+
+def safe_display_lyrics(display_lyrics, hybrid):
+    """Keep the display lines accepted by stable-ts in their original order."""
+    if not display_lyrics:
+        return ""
+    lines = [line["text"] for section in parse_authored_lyrics(display_lyrics)
+             for line in section["lines"]]
+    diagnostics = hybrid.get("lines") or []
+    if len(lines) != len(diagnostics):
+        raise ValueError("stable-ts display lines no longer match the saved lyric sheet")
+    return "\n".join(line for line, diagnostic in zip(lines, diagnostics)
+                     if not diagnostic.get("hidden"))
+
+
+def _timing_milliseconds(seconds):
+    """Round a non-negative timestamp half-up for the editable TSV."""
+    return max(0, int(math.floor(float(seconds) * 1000 + 0.5 + 1e-9)))
+
+
+def timing_timestamp(seconds):
+    """Format an absolute timestamp as HH:MM:SS.mmm without losing Unicode text."""
+    return _format_timing_milliseconds(_timing_milliseconds(seconds))
+
+
+def _format_timing_milliseconds(milliseconds):
+    """Format an already-normalized millisecond value for the TSV."""
+    hour, milliseconds = divmod(milliseconds, 3_600_000)
+    minute, milliseconds = divmod(milliseconds, 60_000)
+    second, milliseconds = divmod(milliseconds, 1_000)
+    return f"{hour:02d}:{minute:02d}:{second:02d}.{milliseconds:03d}"
+
+
+def parse_timing_timestamp(value):
+    """Parse the TSV's deliberately strict millisecond timestamp format."""
+    match = TIMING_TSV_TIMESTAMP.match((value or "").strip())
+    if not match:
+        raise ValueError("timestamp must use HH:MM:SS.mmm (for example 00:00:26.000)")
+    hour, minute, second, millisecond = (int(part) for part in match.groups())
+    if minute >= 60 or second >= 60:
+        raise ValueError("timestamp has an out-of-range minute or second")
+    return hour * 3600 + minute * 60 + second + millisecond / 1000
+
+
+def timing_sidecar_text(groups):
+    """Serialize renderer groups into an editable UTF-8 TSV timing table."""
+    from io import StringIO
+
+    stream = StringIO(newline="")
+    writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+    writer.writerow(TIMING_TSV_COLUMNS)
+    for line_id, word_id, item, start, end in _timing_sidecar_rows(groups):
+        writer.writerow((line_id, word_id, start, end, item["w"]))
+    return stream.getvalue()
+
+
+def _timing_sidecar_rows(groups):
+    """Yield TSV-safe timestamps while retaining the original renderer item."""
+    for line_id, rows in enumerate(groups, 1):
+        previous_end = None
+        for word_id, item in enumerate((it for row in rows for it in row), 1):
+            # TSV has millisecond precision, while a provider may supply a
+            # shorter-than-one-ms span. Normalize only those unrepresentable
+            # boundaries so an exported, unedited sidecar is always valid.
+            start = _timing_milliseconds(item["s"])
+            if previous_end is not None:
+                start = max(start, previous_end)
+            end = max(start + 1, _timing_milliseconds(item["e"]))
+            yield (line_id, word_id, item, _format_timing_milliseconds(start),
+                   _format_timing_milliseconds(end))
+            previous_end = end
+
+
+def export_timing_sidecar(path, groups):
+    """Write the current renderer words as a human-editable timing sidecar."""
+    atomic_write_text(path, timing_sidecar_text(groups))
+
+
+def apply_timing_sidecar(path, groups):
+    """Validate and apply a TSV timing sidecar to already-aligned groups.
+
+    IDs and text are a strict snapshot check, so an old sidecar cannot silently
+    land on a different repeated lyric.  Timings are validated per rendered
+    event; independent dialogue events may still overlap exactly as before.
+    """
+    path = Path(path)
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read timing sidecar: {error}") from error
+    return apply_timing_sidecar_text(source, groups)
+
+
+def apply_timing_sidecar_text(source, groups):
+    """Validate TSV text from the in-app editor against renderer groups."""
+    if not isinstance(source, str):
+        raise ValueError("timing sidecar is not text")
+    try:
+        rows = list(csv.reader(source.splitlines(), delimiter="\t"))
+    except csv.Error as error:
+        raise ValueError(f"cannot parse timing sidecar: {error}") from error
+    if not rows or tuple(rows[0]) != TIMING_TSV_COLUMNS:
+        raise ValueError("sidecar line 1: expected header " + "\t".join(TIMING_TSV_COLUMNS))
+
+    expected = {(line_id, word_id): {"item": item, "start": start, "end": end}
+                for line_id, word_id, item, start, end in _timing_sidecar_rows(groups)}
+    received, parsed = set(), {}
+    for number, row in enumerate(rows[1:], 2):
+        if len(row) != len(TIMING_TSV_COLUMNS):
+            raise ValueError(f"sidecar line {number}: expected 5 tab-separated columns")
+        line_value, word_value, start_value, end_value, text_value = row
+        if not line_value.isdecimal() or not word_value.isdecimal() or \
+                int(line_value) < 1 or int(word_value) < 1:
+            raise ValueError(f"sidecar line {number}: line_id and word_id must be positive integers")
+        key = (int(line_value), int(word_value))
+        if key in received:
+            raise ValueError(f"sidecar line {number}: duplicate line_id {key[0]} word_id {key[1]}")
+        if key not in expected:
+            raise ValueError(f"sidecar line {number}: unknown line_id {key[0]} word_id {key[1]}")
+        expected_item = expected[key]["item"]
+        if text_value != expected_item["w"]:
+            raise ValueError(f"sidecar line {number}: text does not match line_id {key[0]} word_id {key[1]}")
+        try:
+            parsed_start = parse_timing_timestamp(start_value)
+            parsed_end = parse_timing_timestamp(end_value)
+        except ValueError as error:
+            raise ValueError(f"sidecar line {number}: {error}") from error
+        changed = (start_value != expected[key]["start"] or
+                   end_value != expected[key]["end"])
+        if parsed_end <= parsed_start:
+            raise ValueError(f"sidecar line {number}: end must be after start")
+        received.add(key)
+        # Retain original high-precision timings for untouched words. This is
+        # what prevents an edit to one row from perturbing later word starts.
+        parsed[key] = (parsed_start if start_value != expected[key]["start"]
+                       else expected_item["s"],
+                       parsed_end if end_value != expected[key]["end"]
+                       else expected_item["e"], number, changed)
+    missing = sorted(set(expected) - received)
+    if missing:
+        line_id, word_id = missing[0]
+        raise ValueError(f"sidecar is missing line_id {line_id} word_id {word_id}")
+
+    revised = []
+    previous_line_start = None
+    for line_id, event_rows in enumerate(groups, 1):
+        revised_rows, previous_end, previous_changed = [], None, False
+        word_id = 0
+        for row in event_rows:
+            revised_row = []
+            for item in row:
+                word_id += 1
+                start, end, number, changed = parsed[(line_id, word_id)]
+                if previous_end is not None and start < previous_end and \
+                        (changed or previous_changed):
+                    raise ValueError(f"sidecar line {number}: start overlaps the preceding word")
+                clone = dict(item)
+                clone.update({"s": start, "e": end})
+                revised_row.append(clone)
+                previous_end = end
+                previous_changed = changed
+            revised_rows.append(revised_row)
+        line_start = revised_rows[0][0]["s"]
+        line_changed = parsed[(line_id, 1)][3]
+        if previous_line_start is not None and line_start < previous_line_start[0] and \
+                (line_changed or previous_line_start[1]):
+            raise ValueError(f"sidecar line {parsed[(line_id, 1)][2]}: line start moves before the prior line")
+        previous_line_start = (line_start, line_changed)
+        revised.append(revised_rows)
+    return revised
+
+
+def _karaoke_centiseconds(seconds):
+    """Quantize an absolute timestamp once, avoiding cumulative round-off drift."""
+    return max(0, int(math.floor(float(seconds) * 100 + 0.5 + 1e-9)))
+
+
+def ass_time_centiseconds(centiseconds):
+    """Format an already-quantized ASS timestamp without a second rounding step."""
+    hour, centiseconds = divmod(max(0, int(centiseconds)), 360_000)
+    minute, centiseconds = divmod(centiseconds, 6_000)
+    second, centiseconds = divmod(centiseconds, 100)
+    return f"{hour:d}:{minute:02d}:{second:02d}.{centiseconds:02d}"
+
+
 def build_karaoke_ass(aligned, font="Helvetica", hi="&H00A6D322", lo="&H00C8C8C8",
                       lead=0.18, tail=0.45, banner=None, lyrics_text="",
                       aligner_method=None, paren_hi="&H0042B9F5",
-                      paren_lo="&H0080BFE0"):
+                      paren_lo="&H0080BFE0", timing_groups=None,
+                      display_lyrics=""):
     """ASS with \\kf karaoke fills. Colours are &HAABBGGRR - BGR, not RGB.
 
     banner=(title, subtitle) draws the title through libass instead of
     drawtext, for ffmpeg builds without freetype."""
-    groups = lines_from_lyrics(aligned, lyrics_text, method=aligner_method)
-    # None means authored alignment was unavailable. An empty list is
-    # intentional: every candidate region was too unreliable to display.
-    if groups is None:
-        groups = group_lyric_lines(aligned)
+    groups = timing_groups if timing_groups is not None else \
+        karaoke_groups(aligned, lyrics_text, aligner_method,
+                       display_lyrics=display_lyrics)
     margin = 56
     size = fit_fontsize(groups, margin=margin)
     # Alignment 8 (top-centre) + a margin puts the baseline at a known
@@ -2581,13 +3371,26 @@ def build_karaoke_ass(aligned, font="Helvetica", hi="&H00A6D322", lo="&H00C8C8C8
         last_event_end = end
 
         parts, prev, plain = [], start, ""
+        # The automatic baseline retains its historical segment rounding. A
+        # sidecar uses absolute centisecond targets, correcting every rounding
+        # discrepancy at that word's local gap instead of carrying it forward.
+        use_absolute_targets = timing_groups is not None
+        elapsed_cs = _karaoke_centiseconds(start) if use_absolute_targets else None
         paren_active = False
         for ri, row in enumerate(rows):
             if ri:
                 parts.append("\\N")
             first_in_row = True
             for it in row:
-                hold = max(0, int(round((it["s"] - prev) * 100)))
+                if use_absolute_targets:
+                    target_start = _karaoke_centiseconds(it["s"])
+                    target_end = _karaoke_centiseconds(it["e"])
+                    hold = max(0, target_start - elapsed_cs)
+                    duration = max(1, target_end - target_start)
+                    elapsed_cs = target_start + duration
+                else:
+                    hold = max(0, int(round((it["s"] - prev) * 100)))
+                    duration = max(1, int(round((it["e"] - it["s"]) * 100)))
                 add_space = not first_in_row and needs_space(plain, it["w"])
                 if hold and add_space:
                     # A karaoke tag with no following character is overwritten
@@ -2610,11 +3413,14 @@ def build_karaoke_ass(aligned, font="Helvetica", hi="&H00A6D322", lo="&H00C8C8C8
                     else:
                         parts.append("{\\1c%s&\\2c%s&}" % (hi, lo))
                     paren_active = wants_paren
-                parts.append("{\\kf%d}%s" % (max(1, int(round((it["e"] - it["s"]) * 100))),
-                                             ass_escape(it["w"])))
+                parts.append("{\\kf%d}%s" % (duration, ass_escape(it["w"])))
                 plain += it["w"]
                 prev = it["e"]
-        out.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Now,,0,0,0,,"
+        event_start = (ass_time_centiseconds(_karaoke_centiseconds(start))
+                       if use_absolute_targets else ass_time(start))
+        event_end = (ass_time_centiseconds(_karaoke_centiseconds(end))
+                     if use_absolute_targets else ass_time(end))
+        out.append(f"Dialogue: 0,{event_start},{event_end},Now,,0,0,0,,"
                    f"{{\\fad(140,140)}}{''.join(parts)}")
         rendered += 1
     return "\n".join(out) + "\n", rendered
@@ -2622,6 +3428,276 @@ def build_karaoke_ass(aligned, font="Helvetica", hi="&H00A6D322", lo="&H00C8C8C8
 
 def ass_escape(s):
     return s.replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", " ")
+
+
+MAX_SUBTITLE_EDIT_BYTES = 1024 * 1024
+ASS_DIALOGUE_RE = re.compile(
+    r"^Dialogue:\s*[^,]*,\s*([^,]+),\s*([^,]+),", re.IGNORECASE)
+ASS_TIME_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})\.(\d{2})$")
+
+
+def ass_seconds(value):
+    """Parse the ASS H:MM:SS.cc format used by the local renderer."""
+    match = ASS_TIME_RE.match((value or "").strip())
+    if not match:
+        raise ValueError(f"invalid ASS timestamp '{value}'")
+    hour, minute, second, centisecond = (int(part) for part in match.groups())
+    if minute >= 60 or second >= 60:
+        raise ValueError(f"invalid ASS timestamp '{value}'")
+    return hour * 3600 + minute * 60 + second + centisecond / 100
+
+
+def validate_editable_ass(text):
+    """Accept a conservative, renderer-compatible subset of an ASS document."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("subtitle text is empty")
+    if len(text.encode("utf-8")) > MAX_SUBTITLE_EDIT_BYTES:
+        raise ValueError("subtitle text exceeds the 1 MB limit")
+    if "\x00" in text or "[Script Info]" not in text or "[Events]" not in text:
+        raise ValueError("the ASS [Script Info] and [Events] sections are required")
+    dialogues = 0
+    for number, line in enumerate(text.splitlines(), 1):
+        match = ASS_DIALOGUE_RE.match(line)
+        if not match:
+            continue
+        start, end = ass_seconds(match.group(1)), ass_seconds(match.group(2))
+        if end <= start:
+            raise ValueError(f"Dialogue line {number} ends before it starts")
+        dialogues += 1
+    if not dialogues:
+        raise ValueError("the ASS file has no Dialogue events")
+    return dialogues
+
+
+ASS_KF_TAG_RE = re.compile(r"\{\\kf(\d+)\}")
+
+
+def _ass_dialogue_fields(line):
+    """Return ASS dialogue fields, including the unparsed Text field."""
+    if not line.startswith("Dialogue:"):
+        return None
+    fields = line[len("Dialogue:"):].lstrip().split(",", 9)
+    return fields if len(fields) == 10 else None
+
+
+def _karaoke_chunk_text(chunk):
+    """Visible word text following one karaoke tag, minus ASS control codes."""
+    visible = re.sub(r"\{[^}]*\}", "", chunk)
+    return visible.replace("\\N", " ").replace("\u200b", "").strip()
+
+
+def karaoke_groups_from_ass(ass_text):
+    """Convert existing generated ASS to editable per-word timing groups.
+
+    This is the migration path for a video that was already waiting for
+    approval before the TSV sidecar existed.  It reads only the existing
+    ``\\kf`` timeline; styles, fades, and dialogue boundaries remain in ASS.
+    """
+    groups = []
+    for number, line in enumerate((ass_text or "").splitlines(), 1):
+        fields = _ass_dialogue_fields(line)
+        if not fields:
+            continue
+        tags = list(ASS_KF_TAG_RE.finditer(fields[9]))
+        if not tags:
+            continue
+        try:
+            clock = _karaoke_centiseconds(ass_seconds(fields[1]))
+        except ValueError as error:
+            raise ValueError(f"ASS Dialogue line {number}: {error}") from error
+        words = []
+        for index, tag in enumerate(tags):
+            chunk_end = tags[index + 1].start() if index + 1 < len(tags) else len(fields[9])
+            chunk = fields[9][tag.end():chunk_end]
+            duration = int(tag.group(1))
+            word = _karaoke_chunk_text(chunk)
+            if word:
+                words.append({"w": word, "s": clock / 100, "e": (clock + duration) / 100})
+            clock += duration
+        if words:
+            groups.append([words])
+    if not groups:
+        raise ValueError("the ASS file has no word-level karaoke timing")
+    return groups
+
+
+def render_ass_timing_sidecar(ass_text, groups):
+    """Apply absolute TSV timing groups while preserving the original ASS text.
+
+    Only karaoke durations and zero-width gap carriers are rebuilt. Dialogue
+    fields, fades, colours, style changes, and visible lyric chunks are left
+    in place, so an in-progress video retains its approved appearance.
+    """
+    output, group_index = [], 0
+    for line in (ass_text or "").splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        content = line[:-1] if ending else line
+        fields = _ass_dialogue_fields(content)
+        tags = list(ASS_KF_TAG_RE.finditer(fields[9])) if fields else []
+        words = []
+        for index, tag in enumerate(tags):
+            chunk_end = tags[index + 1].start() if index + 1 < len(tags) else len(fields[9])
+            chunk = fields[9][tag.end():chunk_end]
+            if _karaoke_chunk_text(chunk):
+                words.append((tag, chunk))
+        if not words:
+            output.append(line)
+            continue
+        if group_index >= len(groups):
+            raise ValueError("timing sidecar has fewer lyric events than the ASS file")
+        wanted = [item for row in groups[group_index] for item in row]
+        if len(words) != len(wanted):
+            raise ValueError(f"timing sidecar line {group_index + 2}: word count no longer matches the ASS event")
+        try:
+            clock = _karaoke_centiseconds(ass_seconds(fields[1]))
+        except ValueError as error:
+            raise ValueError(f"ASS Dialogue event {group_index + 1}: {error}") from error
+        pieces, cursor, word_index, pending = [fields[9][:tags[0].start()]], tags[0].start(), 0, ""
+        for index, tag in enumerate(tags):
+            chunk_end = tags[index + 1].start() if index + 1 < len(tags) else len(fields[9])
+            chunk = fields[9][tag.end():chunk_end]
+            pieces.append(fields[9][cursor:tag.start()]) if cursor < tag.start() else None
+            if _karaoke_chunk_text(chunk):
+                item = wanted[word_index]
+                target_start = _karaoke_centiseconds(item["s"])
+                target_end = _karaoke_centiseconds(item["e"])
+                gap = max(0, target_start - clock)
+                if gap:
+                    # Reuse the original inter-word space when there is one:
+                    # libass needs a glyph after a timing-only tag. A zero-width
+                    # carrier keeps contraction/leading gaps intact.
+                    pieces.append("{\\kf%d}%s" % (gap, pending or "\u200b"))
+                    pending = ""
+                elif pending:
+                    pieces.append(pending)
+                    pending = ""
+                duration = max(1, target_end - target_start)
+                pieces.append("{\\kf%d}%s" % (duration, chunk))
+                clock = max(clock, target_start) + duration
+                word_index += 1
+            else:
+                # Retain the original visible spacing/control codes but remove
+                # its obsolete timing tag; the absolute gap above owns timing.
+                pending += chunk
+            cursor = chunk_end
+        pieces.append(pending)
+        if cursor < len(fields[9]):
+            pieces.append(fields[9][cursor:])
+        fields[9] = "".join(pieces)
+        output.append("Dialogue: " + ",".join(fields) + ending)
+        group_index += 1
+    if group_index != len(groups):
+        raise ValueError("timing sidecar has more lyric events than the ASS file")
+    return "".join(output)
+
+
+def subtitle_timing_path(generated_ass):
+    return Path(generated_ass).with_suffix(".timings.tsv")
+
+
+def subtitle_timing_text(job):
+    """Load or convert a review job's ASS into the human-readable TSV."""
+    generated, override = subtitle_paths(job)
+    sidecar = subtitle_timing_path(generated)
+    if sidecar.is_file():
+        return sidecar.read_text(encoding="utf-8"), sidecar, bool(override.is_file())
+    source = override if override.is_file() else generated
+    groups = karaoke_groups_from_ass(source.read_text(encoding="utf-8"))
+    text = timing_sidecar_text(groups)
+    atomic_write_text(sidecar, text)
+    return text, sidecar, bool(override.is_file())
+
+
+def save_subtitle_timing_text(job, text):
+    """Validate TSV and materialize an ASS override for immediate re-rendering."""
+    generated, override = subtitle_paths(job)
+    sources = [generated] + ([override] if override.is_file() else [])
+    last_error = None
+    for source in sources:
+        try:
+            baseline = source.read_text(encoding="utf-8")
+            groups = karaoke_groups_from_ass(baseline)
+            revised = apply_timing_sidecar_text(text, groups)
+            rendered = render_ass_timing_sidecar(baseline, revised)
+            validate_editable_ass(rendered)
+            atomic_write_text(subtitle_timing_path(generated), timing_sidecar_text(revised))
+            atomic_write_text(override, rendered)
+            return sum(len(row) for event in revised for row in event)
+        except (OSError, ValueError) as error:
+            last_error = error
+    raise ValueError(str(last_error or "could not apply timing sidecar"))
+
+
+def subtitle_paths(job):
+    """Return only job-owned subtitle paths; callers never supply filesystem paths."""
+    generated = Path(job.get("subtitle_generated_path") or "")
+    override = Path(job.get("subtitle_override_path") or "")
+    if not generated.is_file() or not override.name:
+        raise RuntimeError("the generated subtitle source is no longer available")
+    if override.parent != generated.parent:
+        raise RuntimeError("the subtitle override path is invalid")
+    return generated, override
+
+
+def effective_subtitle_path(job):
+    generated, override = subtitle_paths(job)
+    return override if override.is_file() else generated
+
+
+def recover_subtitle_review_metadata(job_id):
+    """Upgrade a pre-editor paused review when its local ASS inputs remain."""
+    job = job_snapshot(job_id)
+    if not job or not job.get("pipeline") or job.get("status") != "paused_video":
+        return False
+    existing = job.get("subtitle_generated_path")
+    if existing and Path(existing).is_file():
+        return True
+    song = selected_variant(job, "song_variants", "selected_song") or {}
+    track = dict(song.get("track") or {})
+    mp3 = Path(song.get("file") or track.get("file") or "")
+    root = Path(job.get("staging_folder") or "")
+    candidates = [mp3.with_suffix(".ass")] if mp3.name else []
+    if root.is_dir():
+        # Old review jobs did not journal their ASS path. Search only their
+        # own staging folder, never a caller-provided or global filesystem path.
+        candidates.extend(sorted(root.rglob("*.ass")))
+    generated = next((path for path in candidates if path.is_file()), None)
+    if not generated:
+        return False
+    try:
+        validate_editable_ass(generated.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not mp3.is_file():
+        # The historical video path and ASS location share the song folder.
+        inferred = generated.with_suffix(".mp3")
+        if inferred.is_file():
+            mp3 = inferred
+    background = mp3.parent / f"{mp3.stem} - background.png" if mp3.name else None
+    if not mp3.is_file() or not background or not background.is_file():
+        return False
+    focus = mp3.parent / f"{mp3.stem} - lyric focus background.png"
+    settings = dict(job.get("subtitle_render_settings") or {})
+    settings.setdefault("height", int(CONFIG.get("video_height") or 1080))
+    settings.setdefault("fps", int(CONFIG.get("video_fps") or 30))
+    settings.setdefault("visualizer", CONFIG.get("visualizer") or "bars")
+    settings.setdefault("shimmer", bool(CONFIG.get("shimmer", True)))
+    settings.setdefault("interlude_mode", bool(CONFIG.get("interlude_mode", True)))
+    settings.setdefault("lyric_focus_band", bool(CONFIG.get("lyric_focus_band", True)))
+    settings.setdefault("focus_opacity", 0.90)
+    settings.setdefault("crf", int(CONFIG.get("video_crf") or 21))
+    override = generated.with_name(generated.stem + ".edited.ass")
+    set_job(job_id,
+            subtitle_generated_path=str(generated), subtitle_override_path=str(override),
+            subtitle_effective_path=str(override if override.is_file() else generated),
+            subtitle_audio_path=str(mp3), subtitle_background_path=str(background),
+            subtitle_focus_background_path=str(focus if focus.is_file() else ""),
+            subtitle_basename=safe_name(Path(job.get("video_path") or mp3.stem).stem),
+            subtitle_accent=palette_for(job.get("title") or "")[2],
+            subtitle_render_settings=settings,
+            subtitle_revision=int(job.get("subtitle_revision") or 0),
+            message="video ready for approval; manual subtitle timing is available")
+    return True
 
 
 # Each kie.ai image model takes a DIFFERENT input schema. Sending one shape to
@@ -2908,7 +3984,7 @@ def ff_path(p):
 
 
 def build_drawtext_lyrics(aligned, w, h, font, tmpdir, accent="0x22d3a6",
-                          lyrics_text=""):
+                          lyrics_text="", display_lyrics=""):
     """
     Lyrics without libass: one drawtext per line, gated by `enable=between()`.
 
@@ -2916,9 +3992,7 @@ def build_drawtext_lyrics(aligned, w, h, font, tmpdir, accent="0x22d3a6",
     line appears and leaves on the beat, and the next line previews faintly.
     Used when ffmpeg has freetype but no libass.
     """
-    groups = lines_from_lyrics(aligned, lyrics_text)
-    if groups is None:
-        groups = group_lyric_lines(aligned)
+    groups = karaoke_groups(aligned, lyrics_text, display_lyrics=display_lyrics)
     lines = [[it for r in g for it in r] for g in groups]
     parts, files = [], []
     fs = max(20, int(h * 0.072))
@@ -3219,6 +4293,93 @@ def lyric_focus_fade_expression(windows, fade_seconds=0.45):
     return expression
 
 
+MAX_VIDEO_BYTES = 30_000_000
+VIDEO_SIZE_HEADROOM = 0.95
+
+
+def video_bitrate_budget(duration, max_bytes=MAX_VIDEO_BYTES,
+                         headroom=VIDEO_SIZE_HEADROOM):
+    """Return video/audio kbps that keep a complete MP4 below ``max_bytes``.
+
+    The payload budget leaves five percent for MP4 tables, encoder variance,
+    and fast-start metadata. Short videos retain the historical 2500/192 kbps
+    ceilings; longer videos give up video bitrate first, then audio bitrate.
+    """
+    try:
+        duration = float(duration)
+        max_bytes = int(max_bytes)
+        headroom = float(headroom)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0 or max_bytes <= 0:
+        return 2500, 192
+    total_kbps = int(max_bytes * 8 * max(0.1, min(1.0, headroom)) /
+                     (duration * 1000))
+    if total_kbps < 96:
+        raise RuntimeError(
+            "audio is too long to make a complete video under the 30 MB limit")
+    if total_kbps >= 500:
+        audio_kbps = 192
+    elif total_kbps >= 350:
+        audio_kbps = 128
+    elif total_kbps >= 220:
+        audio_kbps = 96
+    else:
+        audio_kbps = 48
+    video_kbps = total_kbps - audio_kbps
+    if video_kbps < 64:
+        video_kbps = 64
+        audio_kbps = total_kbps - video_kbps
+    return min(2500, video_kbps), max(32, audio_kbps)
+
+
+def enforce_video_size_limit(ff, video_path, duration,
+                             max_bytes=MAX_VIDEO_BYTES,
+                             progress_callback=None, process_callback=None):
+    """Recompress an exceptional oversize render, or refuse to publish it."""
+    video_path = Path(video_path)
+    if not video_path.is_file() or video_path.stat().st_size <= max_bytes:
+        return video_path
+    duration = duration or audio_duration(ff, video_path)
+    if not duration:
+        raise RuntimeError("could not verify a duration for the 30 MB video limit")
+
+    # A capped-CRF encode should already land under its 95% payload budget.
+    # These deeper fallbacks cover muxer/encoder variance without making every
+    # normal render pay for a second generation of video encoding.
+    last_size = video_path.stat().st_size
+    for fraction in (0.86, 0.74):
+        temp_path = video_path.with_name(
+            f".{video_path.name}.{uuid.uuid4().hex}.size-cap.mp4")
+        video_kbps, audio_kbps = video_bitrate_budget(
+            duration, max_bytes=int(max_bytes * fraction), headroom=1.0)
+        args = [
+            "-i", str(video_path), "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libx264", "-preset", "medium",
+            "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k",
+            "-bufsize", f"{max(256, video_kbps * 2)}k",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+            "-movflags", "+faststart", "-f", "mp4", str(temp_path),
+        ]
+        try:
+            print(f"[ffmpeg] rendered video is {last_size / 1e6:.1f} MB; "
+                  "applying the 30 MB delivery cap")
+            run_ffmpeg(ff, args, "video size cap",
+                       progress_callback=progress_callback, duration=duration,
+                       process_callback=process_callback)
+            last_size = temp_path.stat().st_size
+            if last_size <= max_bytes:
+                temp_path.replace(video_path)
+                return video_path
+        finally:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+    raise RuntimeError(
+        f"video remained {last_size / 1e6:.1f} MB after applying the 30 MB limit")
+
+
 def render_lyric_video(ff, mp3, bg_png, ass_path, out_mp4, height=1080, fps=30,
                        vis="bars", crf=21, drawtext_chain=None, accent="0x22d3a6",
                        shimmer=True, interlude_mode=True, lyric_focus_band=True,
@@ -3326,8 +4487,9 @@ def render_lyric_video(ff, mp3, bg_png, ass_path, out_mp4, height=1080, fps=30,
                    f"({band_h - 1}-Y)/{feather:.1f}))")
         alpha = max(0.0, min(1.0, float(focus_opacity)))
         chains.append(
-            f"color=white:s={w}x{band_h}:r={fps},format=gray,"
-            f"geq=lum='clip(255*{alpha:.3f}*({spatial})*({fade}),0,255)'"
+            f"color=white:s=2x{band_h}:r={fps},format=gray,"
+            f"geq=lum='clip(255*{alpha:.3f}*({spatial})*({fade}),0,255)',"
+            f"scale={w}:{band_h}:flags=neighbor"
             "[focus_alpha]"
         )
         chains.append("[focus_rgb][focus_alpha]alphamerge[focus_strip]")
@@ -3358,15 +4520,17 @@ def render_lyric_video(ff, mp3, bg_png, ass_path, out_mp4, height=1080, fps=30,
     args = ["-loop", "1", "-i", str(bg_png)]
     if use_focus_art:
         args += ["-loop", "1", "-i", str(focus_bg_png)]
+    video_kbps, audio_kbps = video_bitrate_budget(dur)
     args += ["-i", str(mp3),
             "-filter_complex", ";".join(chains),
             "-map", f"[{last}]", "-map", amap,
             # A near-static frame compresses enormously better with
             # tune=stillimage. Shimmer is deliberately sparse and subtle.
             "-c:v", "libx264", "-preset", "medium", "-tune", "stillimage",
-            "-crf", str(int(crf)), "-maxrate", "2500k", "-bufsize", "5000k",
+            "-crf", str(int(crf)), "-maxrate", f"{video_kbps}k",
+            "-bufsize", f"{max(256, video_kbps * 2)}k",
             "-pix_fmt", "yuv420p", "-r", str(int(fps)),
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+            "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-movflags", "+faststart"]
     # Explicit -t, else the looped still image encodes forever.
     args += (["-t", f"{dur:.3f}"] if dur else ["-shortest"])
     # The recovery file deliberately ends in .part so folder watchers cannot
@@ -3374,12 +4538,102 @@ def render_lyric_video(ff, mp3, bg_png, ass_path, out_mp4, height=1080, fps=30,
     args += ["-f", "mp4", str(out_mp4)]
     run_ffmpeg(ff, args, "video render", progress_callback=progress_callback,
                duration=dur, process_callback=process_callback)
+    try:
+        enforce_video_size_limit(
+            ff, out_mp4, dur, progress_callback=progress_callback,
+            process_callback=process_callback)
+    except Exception:
+        # Never leave an oversize path looking like a finished deliverable.
+        try:
+            Path(out_mp4).unlink()
+        except OSError:
+            pass
+        raise
     return out_mp4
 
 
 # Song, image, and encoder work share the configured external-work budget.
 # Gate-paused jobs never acquire it.
 VIDEO_SLOTS = _slots
+
+
+def render_video_aws(job_id, assets, settings, destination, journal_key="cloud_execution",
+                     release_slot=None):
+    """Run or reconcile one paid attempt, then verify its local MP4 download."""
+    import aws_render
+    config = aws_settings()
+    aws_render._config(config)
+    job = job_snapshot(job_id)
+    execution = job.get(journal_key)
+    fresh_attempt = not execution
+    if not execution:
+        attempt = uuid.uuid4().hex
+        execution = {
+            "job_id": job_id, "attempt_id": attempt, "status": "dispatching",
+            "result_uri": f"s3://{config['bucket']}/render-results/{job_id}/{attempt}/result.json",
+        }
+        set_job(job_id, **{journal_key: execution})
+    else:
+        state = aws_render.wait_or_poll_render(config, execution, wait_seconds=0)
+        if state["status"] == "succeeded":
+            aws_render.download_verified(config, state, destination)
+            set_job(job_id, **{journal_key: state})
+            return state
+        if state["status"] != "running":
+            raise RuntimeError((state.get("result") or {}).get("error") or
+                               "AWS render attempt failed; start an explicit new attempt")
+    if not execution.get("task_arn"):
+        execution = aws_render.reconcile_render(config, execution)
+        if not execution.get("task_arn") and not execution.get("result"):
+            if not fresh_attempt:
+                raise RuntimeError("AWS dispatch is unconfirmed; inspect the saved attempt before retrying")
+            try:
+                execution = aws_render.dispatch_render(
+                    config, job_id, execution["attempt_id"], assets, settings)
+            except Exception:
+                execution = aws_render.reconcile_render(config, execution)
+                if not execution.get("task_arn") and not execution.get("result"):
+                    raise
+        set_job(job_id, **{journal_key: execution})
+    if release_slot:
+        release_slot()
+    set_job(job_id, phase="render", progress=None, message="encoding video on AWS")
+    while True:
+        if JOB_CANCELS.setdefault(job_id, threading.Event()).is_set():
+            aws_render.cancel_render(config, execution)
+            raise InterruptedError("cloud video cancelled")
+        state = aws_render.wait_or_poll_render(config, execution, wait_seconds=15)
+        set_job(job_id, **{journal_key: state})
+        if state["status"] == "running":
+            continue
+        if state["status"] != "succeeded":
+            raise RuntimeError((state.get("result") or {}).get("error") or
+                               "AWS render ended without a successful result")
+        aws_render.download_verified(config, state, destination)
+        return state
+
+
+def complete_video_job(job_id, out, folder, pipeline):
+    out = Path(out)
+    size = out.stat().st_size / 1e6
+    if pipeline:
+        fields = job_snapshot(job_id).get("current_fields") or JOB_FORMS.get(job_id) or {}
+        delivery_mode = delivery_details(fields)[0]
+        paused = bool(CONFIG.get("gate_video")) or delivery_mode != "none"
+        set_job(job_id, status=("paused_video" if paused else "running"), stage="video",
+                phase="done", progress=100, encoder_pid=None, video_path=str(out),
+                message=("video ready for approval" if paused else "publishing video"),
+                tracks=[{"file": str(out), "name": out.name, "video": True}], folder=str(folder))
+        if not paused:
+            finalize_pipeline_job(job_id)
+    else:
+        set_job(job_id, status="done", phase="done", progress=100,
+                encoder_pid=None, message=f"done - {size:.1f} MB",
+                tracks=[{"file": str(out), "name": out.name, "video": True}],
+                folder=str(folder))
+        with JOBS_LOCK:
+            JOB_FORMS.pop(job_id, None)
+            _save_jobs_locked()
 
 
 def run_video_job(job_id, track, recovering=False):
@@ -3399,7 +4653,7 @@ def run_video_job(job_id, track, recovering=False):
         acquired = True
         ff = find_ffmpeg()
         if not ff:
-            raise RuntimeError("ffmpeg not found. Install it with:  brew install ffmpeg-full")
+            raise RuntimeError("FFmpeg is missing. Install it, then see SETUP.md to check video tools.")
         mp3 = Path(track["file"])
         if not mp3.exists():
             raise RuntimeError("the audio file is missing - was it moved?")
@@ -3408,6 +4662,7 @@ def run_video_job(job_id, track, recovering=False):
         with JOBS_LOCK:
             saved_job = dict(JOBS.get(job_id) or {})
         pipeline = bool(saved_job.get("pipeline"))
+        backend = saved_job.get("render_backend") or "local"
         if pipeline:
             selected_art = str(saved_job.get("video_image_file") or "")
             render_art = str(track.get("pipeline_image") or "")
@@ -3424,14 +4679,7 @@ def run_video_job(job_id, track, recovering=False):
             saved_part.replace(saved_output)
         if saved_output and completed_video_matches(ff, saved_output, expected_duration):
             out = Path(saved_output)
-            size = out.stat().st_size / 1e6
-            set_job(job_id, status="done", phase="done", progress=100,
-                    message=f"recovered completed video - {size:.1f} MB",
-                    tracks=[{"file": str(out), "name": out.name, "video": True}],
-                    folder=str(folder))
-            with JOBS_LOCK:
-                JOB_FORMS.pop(job_id, None)
-                _save_jobs_locked()
+            complete_video_job(job_id, out, folder, pipeline)
             return
         if recovering:
             if (saved_part and saved_job.get("encoder_pid") and
@@ -3457,25 +4705,31 @@ def run_video_job(job_id, track, recovering=False):
 
         # 1. word timings, from cache if we already have them
         words_path = mp3.with_suffix(".words.json")
-        aligned, lyrics_text = [], ""
+        aligned, lyrics_text, display_lyrics_text = [], "", ""
         if words_path.exists():
             try:
                 cached = json.loads(words_path.read_text())
                 aligned = cached.get("alignedWords") or []
                 lyrics_text = cached.get("lyrics") or ""
+                display_lyrics_text = cached.get("display_lyrics") or ""
                 log(f"using cached word timings ({len(aligned)} words)")
             except Exception:
                 aligned = []
-        if not lyrics_text:
+        if not lyrics_text or not display_lyrics_text:
             # older songs: recover the lyrics from the .txt sidecar
             for cand in sorted(folder.glob("*.txt")):
                 try:
                     body = cand.read_text(encoding="utf-8")
                     if "-" * 20 in body:
-                        lyrics_text = body.split("-" * 20, 1)[1].strip()
+                        saved = body.split("-" * 20, 1)[1].strip()
+                        spoken, marker, shown = saved.partition("\n===DISPLAY LYRICS===\n")
+                        lyrics_text = lyrics_text or spoken.strip()
+                        display_lyrics_text = display_lyrics_text or (shown.strip() if marker else "")
                         break
                 except Exception:
                     pass
+        lyrics_text = lyrics_text or fields.get("lyrics") or ""
+        display_lyrics_text = display_lyrics_text or fields.get("display_lyrics") or ""
         if not aligned and track.get("suno_id") and track.get("task_id"):
             log("fetching word-level lyric timings")
             prov = make_provider(CONFIG, track.get("provider"))
@@ -3483,20 +4737,24 @@ def run_video_job(job_id, track, recovering=False):
                 raise RuntimeError(f"{prov.label} has no lyric-alignment endpoint")
             data = prov.timestamps(track["task_id"], track["suno_id"])
             data["lyrics"] = lyrics_text
+            data["display_lyrics"] = display_lyrics_text
             words_path.write_text(json.dumps(data))
             aligned = data["alignedWords"]
             log(f"got {len(aligned)} aligned words")
 
         render_lyrics_text = lyrics_text
+        render_display_text = display_lyrics_text
         if CONFIG.get("lyric_aligner") == "stable-ts-hybrid" and lyrics_text:
             try:
                 hybrid = build_stable_ts_hybrid(
                     mp3, lyrics_text, aligned, ff, scratch_dir=scratch, log=log)
+                safe_display = safe_display_lyrics(display_lyrics_text, hybrid)
                 aligned = hybrid["alignedWords"]
                 # Align only against accepted authored lines. This preserves
                 # long exact line breaks without forcing a deliberately hidden
                 # line back into the output.
                 render_lyrics_text = hybrid.get("safe_lyrics") or ""
+                render_display_text = safe_display
                 if hybrid.get("warnings"):
                     set_job(job_id, note="; ".join(hybrid["warnings"][:3]))
             except Exception as error:
@@ -3596,30 +4854,86 @@ def run_video_job(job_id, track, recovering=False):
         ass_path, dt_chain, dt_files = None, None, []
         if aligned:
             if "subtitles" in have or not have:
+                # Keep editable absolute timestamps beside the generated ASS.
+                # The baseline renderer stays untouched unless an existing TSV
+                # validates against this exact aligned word snapshot.
+                timing_sidecar_path = folder / f"{mp3.stem}.timings.tsv"
+                display_warnings = []
+                baseline_groups = karaoke_groups(
+                    aligned, render_lyrics_text, display_lyrics=render_display_text,
+                    display_warnings=display_warnings)
+                for warning in display_warnings:
+                    log(warning)
+                timing_override = None
+                timing_sidecar_edited = False
+                if timing_sidecar_path.is_file():
+                    try:
+                        timing_override = apply_timing_sidecar(timing_sidecar_path,
+                                                               baseline_groups)
+                        timing_sidecar_edited = (
+                            timing_sidecar_text(timing_override) !=
+                            timing_sidecar_text(baseline_groups))
+                        log(f"applied word timings from {timing_sidecar_path.name}")
+                    except ValueError as error:
+                        raise RuntimeError(f"invalid timing sidecar {timing_sidecar_path.name}: {error}") from error
+                else:
+                    export_timing_sidecar(timing_sidecar_path, baseline_groups)
+                    log(f"wrote editable word timings to {timing_sidecar_path.name}")
                 ass_text, nlines = build_karaoke_ass(
                     aligned, font=ass_font_name(), lyrics_text=render_lyrics_text,
+                    display_lyrics=render_display_text,
                     banner=None if (drew_title or not title.strip())
-                           else (title, subtitle))
+                           else (title, subtitle), timing_groups=timing_override)
                 if CONFIG.get("lyric_aligner") == "stable-ts-hybrid":
                     log("line breaks and timings taken from local stable-ts hybrid")
                 elif render_lyrics_text:
                     log("line breaks taken from the submitted lyrics")
-                ass_path = folder / f"{mp3.stem}.ass"
-                ass_path.write_text(ass_text, encoding="utf-8")
+                # Keep the automatic baseline separate from any operator
+                # correction. Preserve the existing .ass sidecar name; the
+                # selected aligner remains its only writer, while a manual
+                # change can never overwrite that baseline.
+                generated_ass_path = folder / f"{mp3.stem}.ass"
+                override_ass_path = folder / f"{mp3.stem}.edited.ass"
+                atomic_write_text(generated_ass_path, ass_text)
+                ass_path = (generated_ass_path if timing_sidecar_edited
+                            else override_ass_path if override_ass_path.is_file()
+                            else generated_ass_path)
+                if timing_sidecar_edited and override_ass_path.is_file():
+                    log("edited word-timing TSV takes precedence over the raw ASS override")
+                if ass_path == override_ass_path:
+                    try:
+                        validate_editable_ass(ass_path.read_text(encoding="utf-8"))
+                        log("using saved manual subtitle timing")
+                    except Exception as error:
+                        ass_path = generated_ass_path
+                        set_job(job_id, note=f"ignored invalid subtitle override: {str(error)[:140]}")
                 log(f"timed {nlines} lyric lines (word-level karaoke)")
             elif "drawtext" in have:
                 dt_chain, dt_files, nlines = build_drawtext_lyrics(
                     aligned, int(vh * 16 / 9), vh, find_font(), scratch,
-                    lyrics_text=render_lyrics_text)
+                    lyrics_text=render_lyrics_text, display_lyrics=render_display_text)
                 log(f"timed {nlines} lyric lines (no libass - line-level, "
                     f"no word sweep)")
             else:
                 raise RuntimeError(
                     "This ffmpeg has neither 'subtitles' (libass) nor 'drawtext' "
-                    "(freetype), so no lyrics can be drawn. Reinstall with:  "
-                    "brew install ffmpeg-full")
+                    "(freetype), so no lyrics can be drawn. See SETUP.md for a compatible build.")
         else:
             log("no lyric timings - rendering a visualiser-only video")
+
+        if ass_path:
+            # Save only server-created paths in the journal.  The browser can
+            # ask for this source by job id, but cannot select an arbitrary
+            # local file to read or overwrite.
+            set_job(job_id,
+                    subtitle_generated_path=str(generated_ass_path),
+                    subtitle_override_path=str(override_ass_path),
+                    subtitle_effective_path=str(ass_path),
+                    subtitle_audio_path=str(mp3),
+                    subtitle_background_path=str(bg),
+                    subtitle_focus_background_path=str(focus_bg or ""),
+                    subtitle_basename=video_basename,
+                    subtitle_revision=int(saved_job.get("subtitle_revision") or 0))
 
         # 4. render
         set_job(job_id, phase="render", progress=0,
@@ -3696,20 +5010,54 @@ def run_video_job(job_id, track, recovering=False):
             def register_encoder(pid):
                 set_job(job_id, encoder_pid=int(pid))
 
-            render_lyric_video(ff, mp3, bg, ass_path, part,
-                               accent=accent,
-                               height=vh,
-                               fps=int(CONFIG.get("video_fps") or 30),
-                               vis=vis_mode,
-                               shimmer=bool(CONFIG.get("shimmer", True)),
-                               interlude_mode=bool(CONFIG.get("interlude_mode", True)),
-                               lyric_focus_band=bool(CONFIG.get("lyric_focus_band", True)),
-                               focus_bg_png=focus_bg,
-                               focus_opacity=0.90,
-                               crf=int(CONFIG.get("video_crf") or 21),
-                               drawtext_chain=dt_chain,
-                               progress_callback=report_progress,
-                               process_callback=register_encoder)
+            if ass_path:
+                set_job(job_id, subtitle_effective_path=str(ass_path),
+                        subtitle_accent=accent,
+                        subtitle_render_settings={
+                            "height": vh, "fps": int(CONFIG.get("video_fps") or 30),
+                            "visualizer": vis_mode,
+                            "shimmer": bool(CONFIG.get("shimmer", True)),
+                            "interlude_mode": bool(CONFIG.get("interlude_mode", True)),
+                            "lyric_focus_band": bool(CONFIG.get("lyric_focus_band", True)),
+                            "focus_opacity": 0.90,
+                            "crf": int(CONFIG.get("video_crf") or 21),
+                        })
+            if backend == "aws":
+                def release_for_cloud():
+                    nonlocal acquired
+                    if acquired:
+                        VIDEO_SLOTS.release()
+                        acquired = False
+
+                render_video_aws(job_id, {
+                    "audio": mp3, "background": bg, "subtitles": ass_path,
+                    "focus_background": focus_bg,
+                }, {
+                    "accent": accent, "height": vh,
+                    "fps": int(CONFIG.get("video_fps") or 30), "vis": vis_mode,
+                    "shimmer": bool(CONFIG.get("shimmer", True)),
+                    "interlude_mode": bool(CONFIG.get("interlude_mode", True)),
+                    "lyric_focus_band": bool(CONFIG.get("lyric_focus_band", True)),
+                    "focus_opacity": 0.90, "crf": int(CONFIG.get("video_crf") or 21),
+                    "drawtext_chain": dt_chain,
+                }, part, release_slot=release_for_cloud)
+                if not completed_video_matches(ff, part, expected_duration):
+                    raise RuntimeError("downloaded AWS video failed playback or duration verification")
+            else:
+                render_lyric_video(ff, mp3, bg, ass_path, part,
+                                   accent=accent,
+                                   height=vh,
+                                   fps=int(CONFIG.get("video_fps") or 30),
+                                   vis=vis_mode,
+                                   shimmer=bool(CONFIG.get("shimmer", True)),
+                                   interlude_mode=bool(CONFIG.get("interlude_mode", True)),
+                                   lyric_focus_band=bool(CONFIG.get("lyric_focus_band", True)),
+                                   focus_bg_png=focus_bg,
+                                   focus_opacity=0.90,
+                                   crf=int(CONFIG.get("video_crf") or 21),
+                                   drawtext_chain=dt_chain,
+                                   progress_callback=report_progress,
+                                   process_callback=register_encoder)
             part.replace(out)
         finally:
             for f in dt_files:
@@ -3723,24 +5071,7 @@ def run_video_job(job_id, track, recovering=False):
                 log("path copied to the clipboard")
             except Exception:
                 pass
-        size = out.stat().st_size / 1e6
-        if pipeline:
-            paused = bool(CONFIG.get("gate_video"))
-            set_job(job_id, status=("paused_video" if paused else "running"), stage="video",
-                    phase="done", progress=100, encoder_pid=None, video_path=str(out),
-                    message=("video ready for approval" if paused else "publishing video"),
-                    tracks=[{"file": str(out), "name": out.name, "video": True}], folder=str(folder))
-            if not paused:
-                finalize_pipeline_job(job_id)
-        else:
-            set_job(job_id, status="done", phase="done", progress=100,
-                    encoder_pid=None,
-                    message=f"done - {size:.1f} MB",
-                    tracks=[{"file": str(out), "name": out.name, "video": True}],
-                    folder=str(folder))
-            with JOBS_LOCK:
-                JOB_FORMS.pop(job_id, None)
-                _save_jobs_locked()
+        complete_video_job(job_id, out, folder, pipeline)
         log(f"finished -> {out.name}")
     except Exception as e:
         if part:
@@ -3748,7 +5079,7 @@ def run_video_job(job_id, track, recovering=False):
                 part.unlink()
             except OSError:
                 pass
-        if out:
+        if out and not out.is_file():
             try:
                 out.unlink()
             except OSError:
@@ -3783,11 +5114,149 @@ def start_video_job(track, source="manual"):
             "created": time.time(), "created_str": datetime.now().strftime("%H:%M"),
             "tracks": [], "folder": "", "task_id": "", "source": source, "kind": "video",
             "note": "", "phase": "queued", "progress": None,
+            "render_backend": CONFIG.get("render_backend", "local"),
         }
         JOB_FORMS[job_id] = {"track": dict(track)}
         _save_jobs_locked()
     threading.Thread(target=run_video_job, args=(job_id, track), daemon=True).start()
     return job_id
+
+
+def run_subtitle_rerender(job_id, recovering=False):
+    """Re-encode a gated video from saved render inputs and an edited ASS only."""
+    acquired = False
+    part = None
+    try:
+        if not VIDEO_SLOTS.acquire(blocking=False):
+            set_job(job_id, status="queued", phase="render",
+                    message="waiting for the video renderer")
+            VIDEO_SLOTS.acquire()
+        acquired = True
+        job = job_snapshot(job_id)
+        if not job.get("pipeline") or job.get("stage") != "video":
+            raise RuntimeError("subtitle re-rendering is available only during video review")
+        ff = find_ffmpeg()
+        if not ff:
+            raise RuntimeError("FFmpeg is missing. Install it, then see SETUP.md to check video tools.")
+        mp3 = Path(job.get("subtitle_audio_path") or "")
+        bg = Path(job.get("subtitle_background_path") or "")
+        focus_raw = job.get("subtitle_focus_background_path") or ""
+        focus_bg = Path(focus_raw) if focus_raw else None
+        ass_path = effective_subtitle_path(job)
+        if not mp3.is_file() or not bg.is_file():
+            raise RuntimeError("saved audio or background is missing; generate the video again")
+        if focus_bg and not focus_bg.is_file():
+            focus_bg = None
+        validate_editable_ass(ass_path.read_text(encoding="utf-8"))
+        settings = dict(job.get("subtitle_render_settings") or {})
+        revision = max(1, int(job.get("subtitle_revision") or 0))
+        basename = safe_name(job.get("subtitle_basename") or job.get("title") or mp3.stem)
+        if recovering and job.get("output_path"):
+            out = Path(job["output_path"])
+        else:
+            out = reserve_unique_path(mp3.parent / f"{basename} - subtitles v{revision}.mp4")
+            out.unlink()
+        part = video_part_path(out)
+        set_job(job_id, status="running", stage="video", phase="render", progress=0,
+                encoder_pid=None, message="re-rendering edited subtitles — 0%",
+                output_path=str(out), subtitle_effective_path=str(ass_path))
+        started = time.monotonic()
+        progress_state = {"percent": -1, "updated": 0.0}
+
+        def report_progress(fraction):
+            percent = max(0, min(100, int(float(fraction) * 100)))
+            now = time.monotonic()
+            if percent < 100 and (percent <= progress_state["percent"] or
+                                  now - progress_state["updated"] < 0.75):
+                return
+            elapsed = max(0.0, now - started)
+            eta = elapsed * (1.0 - fraction) / fraction if fraction > 0.01 else None
+            remaining = ""
+            if eta is not None and percent < 100:
+                minutes, seconds = divmod(max(0, int(round(eta))), 60)
+                remaining = (f" · about {minutes}m {seconds:02d}s remaining"
+                             if minutes else f" · about {seconds}s remaining")
+            progress_state.update(percent=percent, updated=now)
+            set_job(job_id, phase="render", progress=percent,
+                    message=f"re-rendering edited subtitles — {percent}%{remaining}")
+
+        def register_encoder(pid):
+            set_job(job_id, encoder_pid=int(pid))
+
+        render_settings = {
+            "accent": job.get("subtitle_accent") or palette_for(job.get("title") or "")[2],
+            "height": int(settings.get("height") or CONFIG.get("video_height") or 1080),
+            "fps": int(settings.get("fps") or CONFIG.get("video_fps") or 30),
+            "vis": settings.get("visualizer") or CONFIG.get("visualizer") or "bars",
+            "shimmer": bool(settings.get("shimmer", CONFIG.get("shimmer", True))),
+            "interlude_mode": bool(settings.get("interlude_mode", CONFIG.get("interlude_mode", True))),
+            "lyric_focus_band": bool(settings.get("lyric_focus_band", CONFIG.get("lyric_focus_band", True))),
+            "focus_opacity": float(settings.get("focus_opacity") or 0.90),
+            "crf": int(settings.get("crf") or CONFIG.get("video_crf") or 21),
+        }
+        if job.get("render_backend") == "aws":
+            def release_for_cloud():
+                nonlocal acquired
+                if acquired:
+                    VIDEO_SLOTS.release()
+                    acquired = False
+
+            render_video_aws(job_id, {
+                "audio": mp3, "background": bg, "subtitles": ass_path,
+                "focus_background": focus_bg,
+            }, render_settings, part, journal_key="cloud_revision_execution",
+                release_slot=release_for_cloud)
+            if not completed_video_matches(ff, part, audio_duration(ff, mp3)):
+                raise RuntimeError("downloaded AWS subtitle revision failed playback verification")
+        else:
+            render_lyric_video(
+                ff, mp3, bg, ass_path, part,
+                accent=render_settings["accent"], height=render_settings["height"],
+                fps=render_settings["fps"], vis=render_settings["vis"],
+                shimmer=render_settings["shimmer"],
+                interlude_mode=render_settings["interlude_mode"],
+                lyric_focus_band=render_settings["lyric_focus_band"],
+                focus_bg_png=focus_bg, focus_opacity=render_settings["focus_opacity"],
+                crf=render_settings["crf"],
+                progress_callback=report_progress, process_callback=register_encoder)
+        part.replace(out)
+        versions = list(job.get("subtitle_versions") or [])
+        versions.append({"file": str(out), "name": out.name, "revision": revision,
+                         "created": time.time()})
+        set_job(job_id, status="paused_video", stage="video", phase="done", progress=100,
+                encoder_pid=None, video_path=str(out), output_path=str(out),
+                subtitle_versions=versions, subtitle_rerendering=False,
+                tracks=[{"file": str(out), "name": out.name, "video": True}],
+                message=f"subtitle revision {revision} ready for approval")
+    except Exception as error:
+        if part:
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        # Preserve the prior reviewable video and editor rather than turning a
+        # typo in an ASS line into a dead-end pipeline error.
+        set_job(job_id, status="paused_video", stage="video", encoder_pid=None,
+                subtitle_rerendering=False,
+                message=f"subtitle re-render failed: {str(error)[:220]}")
+        print(f"[{job_id[:8]}] SUBTITLE RERENDER ERROR: {error}")
+    finally:
+        if acquired:
+            VIDEO_SLOTS.release()
+
+
+def start_subtitle_rerender(job_id):
+    job = job_snapshot(job_id)
+    if not job or not job.get("pipeline") or job.get("status") != "paused_video":
+        raise RuntimeError("subtitle re-rendering is available when a video is waiting for approval")
+    effective_subtitle_path(job)  # verifies job-owned source paths before queuing
+    JOB_CANCELS[job_id] = threading.Event()
+    revision = int(job.get("subtitle_revision") or 0) + 1
+    set_job(job_id, status="queued", stage="video", phase="render", progress=0,
+            subtitle_revision=revision, subtitle_rerendering=True,
+            cloud_revision_execution=None,
+            message="queued to re-render edited subtitles")
+    threading.Thread(target=run_subtitle_rerender, args=(job_id,), daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -3906,10 +5375,13 @@ FIELD_ALIASES = {
     "vocal": "vocalGender", "vocals": "vocalGender", "voice": "vocalGender",
     "exclude": "negativeTags", "avoid": "negativeTags", "negative": "negativeTags",
     "lyrics": "lyrics", "words": "lyrics", "lyric": "lyrics",
+    "display lyrics": "display_lyrics",
     "sprint": "tagline", "tagline": "tagline", "subtitle": "tagline",
     "infographic": "infographic", "screen": "infographic",
     "email": "recipient", "notify": "recipient", "requester": "recipient",
     "to": "recipient", "reply": "recipient", "replyto": "recipient",
+    "recipient": "recipient", "delivery": "delivery_mode",
+    "slack channel id": "slack_channel_id",
     "team": "tagline", "project": "tagline",
 }
 TRUEISH = {"yes", "y", "true", "1", "on", "instrumental"}
@@ -4094,6 +5566,25 @@ def scrub_scaffolding(s):
                      if not SECTION_RE.match(marker_text(l))).strip()
 
 
+def validate_display_lyrics(lyrics, display_lyrics):
+    """Keep both sheets line-addressable and limited to spelling changes."""
+    if display_lyrics is None:
+        return
+    if not display_lyrics.strip():
+        raise ValueError("Display lyrics block is empty; remove it or add the matching lines.")
+    spoken = parse_authored_lyrics(lyrics)
+    shown = parse_authored_lyrics(display_lyrics)
+    if len(spoken) != len(shown):
+        raise ValueError("Display lyrics must have the same sections and lines as lyrics.")
+    for section, display_section in zip(spoken, shown):
+        if (section["tag"].casefold() != display_section["tag"].casefold() or
+                len(section["lines"]) != len(display_section["lines"])):
+            raise ValueError("Display lyrics must have the same sections and lines as lyrics.")
+        for line, display_line in zip(section["lines"], display_section["lines"]):
+            if _chars(line["text"]) != _chars(display_line["text"]):
+                raise ValueError(f"Display line must keep the same sung letters: {display_line['text']!r}")
+
+
 def undo_quoted_printable(text):
     """Some senders deliver quoted-printable without a matching
     Content-Transfer-Encoding header, so '=' arrives as '=3D' and every
@@ -4138,21 +5629,25 @@ def parse_request(subject, body, default_style=""):
         title = (sect.get("title") or "").strip() or clean_subject(subject)
         if not title:
             title = (sect.get("tagline") or "").strip()
-        return {
+        return normalize_delivery_fields({
             "title": title or "Untitled",
             "style": scrub_scaffolding(sect.get("style", "")).replace("\n", ", ").strip(", ")
                      or default_style,
             "lyrics": "" if instrumental else scrub_scaffolding(sect.get("lyrics", "")),
+            "display_lyrics": ("" if instrumental else scrub_scaffolding(sect["display_lyrics"]))
+                              if "display_lyrics" in sect else None,
             "model": (sect.get("model") or "").strip(),
             "instrumental": instrumental,
             "negativeTags": (sect.get("negativeTags") or "").strip(),
             "tagline": (sect.get("tagline") or "").strip(),
             "infographic": scrub_scaffolding(sect.get("infographic", "")),
-            "recipient": first_email(sect.get("recipient") or ""),
+            "recipient": sect.get("recipient") or "",
+            "delivery_mode": sect.get("delivery_mode", "none"),
+            "slack_channel_id": sect.get("slack_channel_id", ""),
             "vocalGender": "f" if gender.startswith("f") else "m" if gender.startswith("m") else "",
             "styleWeight": None,
             "weirdnessConstraint": None,
-        }
+        })
 
     fields, lyric_lines, in_lyrics = {}, [], False
     lines = text.split("\n")
@@ -4161,7 +5656,7 @@ def parse_request(subject, body, default_style=""):
             if re.match(r"^\s*-{3,}\s*$", line):
                 in_lyrics = True
                 continue
-            m = re.match(r"^\s*([A-Za-z]{3,14})\s*:\s*(.*)$", line)
+            m = re.match(r"^\s*([A-Za-z][A-Za-z ]{2,30})\s*:\s*(.*)$", line)
             # A structure tag like "[Verse]" means the lyrics have begun.
             if m and not line.lstrip().startswith("["):
                 key = FIELD_ALIASES.get(m.group(1).strip().lower())
@@ -4180,20 +5675,23 @@ def parse_request(subject, body, default_style=""):
     gender = fields.get("vocalGender", "").strip().lower()
     gender = "f" if gender.startswith("f") else "m" if gender.startswith("m") else ""
 
-    return {
+    return normalize_delivery_fields({
         "title": title or "Untitled",
         "style": fields.get("style") or default_style,
         "lyrics": "" if instrumental else lyrics,
+        "display_lyrics": fields.get("display_lyrics"),
         "model": fields.get("model", "").strip(),
         "instrumental": instrumental,
         "negativeTags": fields.get("negativeTags", ""),
         "tagline": fields.get("tagline", "").strip(),
         "infographic": fields.get("infographic", "").strip(),
-        "recipient": first_email(fields.get("recipient", "")),
+        "recipient": fields.get("recipient", ""),
+        "delivery_mode": fields.get("delivery_mode", "none"),
+        "slack_channel_id": fields.get("slack_channel_id", ""),
         "vocalGender": gender,
         "styleWeight": None,
         "weirdnessConstraint": None,
-    }
+    })
 
 
 def sender_allowed(from_addr):
@@ -4369,13 +5867,18 @@ def watch_loop():
             auto = 0
             for item in new:
                 seen[item["mid"]] = 1
-                if CONFIG.get("auto_generate") and sender_allowed(item["from"]):
-                    start_job(item["form"], source=f"auto: {item['from'][:40]}")
-                    auto += 1
-                else:
-                    with INBOX_LOCK:
-                        INBOX[item["id"]] = item
-                        _save_inbox_locked()
+                try:
+                    validate_display_lyrics(item["form"].get("lyrics", ""),
+                                            item["form"].get("display_lyrics"))
+                    if CONFIG.get("auto_generate") and sender_allowed(item["from"]):
+                        start_job(item["form"], source=f"auto: {item['from'][:40]}")
+                        auto += 1
+                        continue
+                except ValueError as error:
+                    item["validation_error"] = str(error)
+                with INBOX_LOCK:
+                    INBOX[item["id"]] = item
+                    _save_inbox_locked()
             save_seen(seen)
             if new:
                 print(f"[watch] {len(new)} new request(s); {auto} auto-started")
@@ -4408,6 +5911,7 @@ def watch_loop():
 # --------------------------------------------------------------------------
 
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 class BadRequest(Exception):
@@ -4457,6 +5961,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             raise BadRequest("invalid JSON body")
 
+    def _upload_image(self):
+        """Receive one browser FormData image without widening JSON endpoints."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._json({"error": "invalid Content-Length"}, 400)
+        if n <= 0:
+            return self._json({"error": "choose an image to upload"}, 400)
+        if n > MAX_IMAGE_UPLOAD_BYTES:
+            return self._json({"error": "image upload is limited to 25 MB"}, 413)
+        content_type = self.headers.get("Content-Type") or ""
+        if not content_type.lower().startswith("multipart/form-data;"):
+            return self._json({"error": "expected a multipart image upload"}, 400)
+        try:
+            raw = self.rfile.read(n)
+            message = email.parser.BytesParser().parsebytes(
+                b"Content-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + raw)
+            job_id = ""
+            fields = None
+            file_name, image_data = "", None
+            for part in message.walk():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                name = part.get_param("name", header="content-disposition")
+                payload = part.get_payload(decode=True) or b""
+                if name == "image" and part.get_filename() and image_data is None:
+                    file_name, image_data = part.get_filename(), payload
+                elif name == "job":
+                    job_id = payload.decode("utf-8", "replace").strip()
+                elif name == "fields":
+                    candidate = json.loads(payload.decode("utf-8", "replace"))
+                    if isinstance(candidate, dict):
+                        fields = candidate
+            if not job_id or image_data is None:
+                raise BadRequest("job and image are required")
+            # Save any open song-detail edits first, matching Generate Image.
+            pipeline_action(job_id, "save_fields", fields)
+            add_uploaded_image(job_id, file_name, image_data)
+            return self._json({"ok": True})
+        except BadRequest as e:
+            return self._json({"error": str(e)}, 400)
+        except Exception as e:
+            return self._json({"error": str(e) or "could not upload image"}, 400)
+
     # ---- routes ----
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -4464,6 +6012,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if u.path in ("/", "/index.html"):
             return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+
+        if u.path == "/api/subtitles":
+            job_id = (q.get("job") or [""])[0]
+            job = job_snapshot(job_id)
+            if not job or not job.get("pipeline") or job.get("status") != "paused_video":
+                return self._json({"error": "subtitles can be edited while a video is waiting for approval"}, 404)
+            try:
+                if not job.get("subtitle_generated_path"):
+                    recover_subtitle_review_metadata(job_id)
+                    job = job_snapshot(job_id)
+                generated, override = subtitle_paths(job)
+                text, sidecar, edited = subtitle_timing_text(job)
+                return self._json({"text": text, "format": "timing-tsv",
+                                   "revision": job.get("subtitle_revision") or 0,
+                                   "edited": edited, "generated_name": generated.name,
+                                   "effective_name": (override if edited else generated).name,
+                                   "timing_name": sidecar.name})
+            except Exception as error:
+                return self._json({"error": str(error)}, 400)
 
         if u.path == "/api/config":
             cls = PROVIDERS.get(CONFIG.get("provider"), KieAi)
@@ -4488,7 +6055,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "allowed_senders": CONFIG.get("allowed_senders"),
                 "max_concurrent": CONFIG.get("max_concurrent"),
                 "gmail_pw_set": bool((CONFIG.get("gmail_app_password") or "").strip()),
+                "slack_token_set": bool((CONFIG.get("slack_bot_token") or "").strip()),
                 "auto_video": CONFIG.get("auto_video"),
+                "render_backend": CONFIG.get("render_backend", "local"),
+                "aws_ready": aws_ready(),
+                "aws_region": CONFIG.get("aws_region") or "",
                 "video_height": CONFIG.get("video_height"),
                 "video_dir": CONFIG.get("video_dir"),
                 "lyric_aligner": CONFIG.get("lyric_aligner", "section"),
@@ -4520,6 +6091,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
 
         if u.path == "/api/jobs":
+            with JOBS_LOCK:
+                review_ids = [j["id"] for j in JOBS.values()
+                              if j.get("pipeline") and j.get("status") == "paused_video" and
+                              not j.get("subtitle_generated_path")]
+            for job_id in review_ids:
+                recover_subtitle_review_metadata(job_id)
             with JOBS_LOCK:
                 jobs = json.loads(json.dumps(sorted(
                     JOBS.values(), key=lambda j: j["created"], reverse=True)))
@@ -4553,6 +6130,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         try:
+            if u.path == "/api/job/upload-image":
+                return self._upload_image()
             body = self._body()
         except RequestTooLarge:
             self.close_connection = True
@@ -4561,14 +6140,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json({"error": str(e)}, 400)
 
         if u.path == "/api/config":
+            if body.get("render_backend") in ("local", "aws"):
+                if body["render_backend"] == "aws" and not aws_ready():
+                    return self._json({"error": "Run AWS setup before choosing AWS rendering."}, 400)
+                CONFIG["render_backend"] = body["render_backend"]
             for k in ("provider", "output_dir", "video_dir", "staging_dir", "rejects_dir", "kie_key", "sunoapi_key", "atlascloud_key",
                       "openai_key", "openai_image_model", "todoist_token", "todoist_project",
-                      "gmail_user", "gmail_app_password", "gmail_label",
+                      "gmail_user", "gmail_app_password", "gmail_label", "slack_bot_token",
                       "default_style", "allowed_senders"):
                 if k in body and body[k] is not None:
                     v = body[k]
                     # blank secret submission = leave the stored one alone
-                    if (k.endswith("_key") or k.endswith("password")) and not str(v).strip():
+                    if (k.endswith("_key") or k.endswith("password") or
+                            k.endswith("_token")) and not str(v).strip():
                         continue
                     CONFIG[k] = str(v).strip()
             if body.get("bg_source") in ("gradient", "ai"):
@@ -4665,15 +6249,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if u.path == "/api/inbox/approve":
             with INBOX_LOCK:
-                item = INBOX.pop(body.get("id"), None)
-                if item:
-                    _save_inbox_locked()
+                item = INBOX.get(body.get("id"))
             if not item:
                 return self._json({"error": "that request is no longer pending"}, 404)
             form = dict(item["form"])
             if body.get("form"):                      # edited in the UI before approving
                 form.update({k: v for k, v in body["form"].items() if v is not None})
-            start_job(form, source=f"email: {item['from'][:40]}")
+            try:
+                start_job(form, source=f"email: {item['from'][:40]}")
+            except ValueError as error:
+                return self._json({"error": str(error)}, 400)
+            with INBOX_LOCK:
+                INBOX.pop(body.get("id"), None)
+                _save_inbox_locked()
             return self._json({"ok": True})
 
         if u.path == "/api/watch/check":
@@ -4692,6 +6280,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)}, 400)
 
+        if u.path == "/api/subtitles/save":
+            job = job_snapshot(body.get("job") or "")
+            text = body.get("text")
+            if not job or not job.get("pipeline") or job.get("status") != "paused_video":
+                return self._json({"error": "subtitles can be saved while a video is waiting for approval"}, 400)
+            try:
+                word_count = save_subtitle_timing_text(job, text)
+                _, override = subtitle_paths(job)
+                set_job(job["id"], subtitle_effective_path=str(override),
+                        message=f"saved manual word timing ({word_count} words)")
+                return self._json({"ok": True, "words": word_count})
+            except Exception as error:
+                return self._json({"error": str(error)}, 400)
+
+        if u.path == "/api/subtitles/reset":
+            job = job_snapshot(body.get("job") or "")
+            if not job or not job.get("pipeline") or job.get("status") != "paused_video":
+                return self._json({"error": "subtitles can be reset while a video is waiting for approval"}, 400)
+            try:
+                generated, override = subtitle_paths(job)
+                if override.exists():
+                    override.unlink()
+                subtitle_timing_path(generated).unlink(missing_ok=True)
+                set_job(job["id"], subtitle_effective_path=str(generated),
+                        message="restored automatic subtitle timing")
+                return self._json({"ok": True})
+            except Exception as error:
+                return self._json({"error": str(error)}, 400)
+
         if u.path == "/api/video":
             jid = body.get("job")
             try:
@@ -4705,8 +6322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not track:
                 return self._json({"error": "can't find that track any more"}, 404)
             if not find_ffmpeg():
-                return self._json({"error": "ffmpeg isn't installed. In Terminal:  "
-                                            "brew install ffmpeg-full"}, 400)
+                return self._json({"error": "FFmpeg is missing. See SETUP.md to install and check it."}, 400)
             return self._json({"ok": True, "id": start_video_job(track)})
 
         if u.path == "/api/inbox/dismiss":
@@ -4718,11 +6334,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/inbox/approve_all":
             with INBOX_LOCK:
                 items = list(INBOX.values())
-                INBOX.clear()
-                _save_inbox_locked()
+            count, errors = 0, []
             for item in items:
-                start_job(item["form"], source=f"email: {item['from'][:40]}")
-            return self._json({"ok": True, "count": len(items)})
+                try:
+                    start_job(item["form"], source=f"email: {item['from'][:40]}")
+                except ValueError as error:
+                    errors.append(f"{item['form'].get('title', 'Untitled')}: {error}")
+                    continue
+                count += 1
+                with INBOX_LOCK:
+                    INBOX.pop(item["id"], None)
+                    _save_inbox_locked()
+            return self._json({"ok": not errors, "count": count, "errors": errors})
 
         if u.path == "/api/generate":
             form = {
@@ -4733,7 +6356,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "instrumental": bool(body.get("instrumental")),
                 "negativeTags": (body.get("negativeTags") or "").strip(),
                 "tagline": (body.get("tagline") or "").strip(),
-                "recipient": first_email(body.get("recipient") or ""),
+                "delivery_mode": body.get("delivery_mode", "none"),
+                "recipient": body.get("recipient") or "",
+                "slack_channel_id": body.get("slack_channel_id") or "",
                 "vocalGender": body.get("vocalGender") or "",
                 "styleWeight": body.get("styleWeight"),
                 "weirdnessConstraint": body.get("weirdnessConstraint"),
@@ -4741,6 +6366,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not form["lyrics"].strip() and not form["style"] and not form["instrumental"]:
                 return self._json({"error": "Give me some lyrics or at least a style."}, 400)
             return self._json({"ok": True, "id": start_job(form, source="manual")})
+
+        if u.path in ("/api/bug/preview", "/api/bug/submit"):
+            import bug_reports
+            stage = str(body.get("stage") or "other")
+            summary = str(body.get("error_summary") or "Unexpected failure")
+            if summary not in bug_reports.SAFE_SUMMARIES:
+                return self._json({"error": "Choose a listed error summary."}, 400)
+            preview = bug_reports.report_preview(stage, summary, APP_VERSION)
+            if u.path.endswith("preview"):
+                return self._json({"preview": preview})
+            try:
+                reference = bug_reports.send_report(preview)
+            except Exception as error:
+                return self._json({"error": f"Bug report could not be sent: {error}"}, 502)
+            return self._json({"ok": True, "reference": reference})
 
         if u.path == "/api/reveal":
             target = Path(os.path.expanduser(body.get("path") or str(final_video_root())))
@@ -4944,6 +6584,12 @@ details[open] summary:before{transform:rotate(90deg)}
 .actions{display:flex;gap:10px;align-items:center;margin-top:20px;
   border-top:1px solid var(--line);padding-top:16px}
 .btns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.image-action{position:relative;display:inline-flex}
+.image-action-main{border-radius:7px 0 0 7px}
+.image-action-caret{border-left:1px solid rgba(255,255,255,.3);border-radius:0 7px 7px 0;padding-left:9px;padding-right:9px}
+.image-action-menu{position:absolute;left:0;top:calc(100% + 5px);z-index:2;
+  min-width:142px;padding:5px;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 10px 24px rgba(0,0,0,.3)}
+.image-action-menu button{width:100%;text-align:left}
 .banner{background:rgba(255,176,32,.09);border:1px solid rgba(255,176,32,.3);
   color:var(--warn);border-radius:9px;padding:10px 12px;font-size:13px;margin-bottom:14px}
 .job{background:var(--panel2);border:1px solid var(--line);border-radius:11px;
@@ -5021,6 +6667,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <div class="spacer"></div>
   <button class="ghost small" onclick="reveal('')">Open delivery folder</button>
   <button class="ghost small" onclick="openSettings()">Settings</button>
+  <button class="ghost small" onclick="openBugReport()">Report a bug</button>
   <button class="ghost small" onclick="quitApp()">Quit</button>
 </header>
 
@@ -5029,6 +6676,33 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div id="warn"></div>
     <div class="banner" id="alertbar" style="display:none"></div>
     <div class="watchbar" id="watchbar" style="display:none"></div>
+
+    <div class="card" id="manualcard" style="margin-bottom:20px">
+      <h2 style="font-size:18px;margin:0 0 3px">Create a Song</h2>
+      <div class="hint">Enter a title, style, and lyrics to start a new song.</div>
+      <label for="title">Title</label>
+      <input type="text" id="title" placeholder="A title for your song">
+      <label for="style">Style</label>
+      <input type="text" id="style" placeholder="indie folk, acoustic guitar, warm">
+      <label for="lyrics">Lyrics</label>
+      <textarea id="lyrics" placeholder="[Verse 1]\nYour lyrics here…"></textarea>
+      <div class="row">
+        <div>
+          <label for="manual_delivery_mode">Delivery</label>
+          <select id="manual_delivery_mode" onchange="syncManualDeliveryFields()">
+            <option value="none" selected>None</option>
+            <option value="slack">Slack</option>
+            <option value="email">Email</option>
+          </select>
+          <div class="hint">Sending starts only after video approval. None keeps the video on this computer.</div>
+        </div>
+        <div id="manual_delivery_target"></div>
+      </div>
+      <div class="actions">
+        <button id="go" onclick="generate()">Generate Song</button>
+        <span class="hint" style="margin:0">Songs and videos remain available in Finished Jobs.</span>
+      </div>
+    </div>
 
     <div class="card" id="inboxcard" style="display:none;margin-bottom:20px">
       <div style="display:flex;align-items:center;margin-bottom:12px">
@@ -5058,6 +6732,32 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     </div>
   </div>
 </div>
+
+<dialog id="bugdlg">
+  <h3 style="margin:0 0 4px">Report a bug</h3>
+  <div class="hint">Choose what failed. Preview the exact details before sending them to Sentry.</div>
+  <label for="bug_stage">Stage</label>
+  <select id="bug_stage" onchange="previewBugReport()">
+    <option value="setup">Setup</option><option value="intake">Intake</option>
+    <option value="song">Song</option><option value="artwork">Artwork</option>
+    <option value="subtitles">Subtitles</option><option value="video">Video</option>
+    <option value="delivery">Delivery</option><option value="interface">Interface</option>
+    <option value="other">Other</option>
+  </select>
+  <label for="bug_summary">Error summary</label>
+  <select id="bug_summary" onchange="previewBugReport()">
+    <option>Unexpected failure</option><option>Rate limit or quota reached</option>
+    <option>Access denied</option><option>Operation timed out</option>
+    <option>Network connection failed</option><option>Video encoding failed</option>
+    <option>File transfer failed</option><option>Required input was invalid or missing</option>
+  </select>
+  <label for="bug_preview">Only these details will be sent</label>
+  <pre id="bug_preview" class="mono" style="white-space:pre-wrap"></pre>
+  <div class="hint">Lyrics, media, paths, account details, and credentials are excluded. Sending is optional.</div>
+  <div class="actions"><button id="bug_send" onclick="sendBugReport()">Send report</button>
+    <button class="ghost" onclick="bugdlg.close()">Cancel</button></div>
+  <div id="bug_result" class="hint"></div>
+</dialog>
 
 <dialog id="dlg">
   <h3 style="margin:0 0 4px">Settings</h3>
@@ -5127,6 +6827,13 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   </div>
   </div>
 
+  <div class="settings-section"><h4>Slack delivery</h4>
+  <label>Slack bot token</label>
+  <input type="password" id="s_slack_token" placeholder="xoxb-… (leave blank to keep current)">
+  <div class="hint" id="s_slack_state"></div>
+  <div class="hint">Local Slack delivery uploads the approved MP4 to the selected channel. The bot needs file upload and channel posting permissions and must belong to the channel.</div>
+  </div>
+
   <div class="settings-section"><h4>Alerts</h4>
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_al"> Warn me before the accounts run dry</label>
   <div class="hint">Checks kie.ai hourly. OpenAI publishes no balance, so that one is
@@ -5138,6 +6845,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   </div>
 
   <div class="settings-section"><h4>Lyric video</h4>
+  <label>Video rendering</label>
+  <select id="s_backend"><option value="local">On this computer</option><option value="aws">AWS parallel jobs</option></select>
+  <div class="hint" id="s_backend_state"></div>
   <div class="row">
     <div><label style="margin-top:0">Resolution</label>
       <select id="s_vh"><option value="1080">1080p</option><option value="720">720p (faster)</option></select></div>
@@ -5219,27 +6929,38 @@ async function loadConfig(){
   const p = CFG.providers.find(x=>x.id===CFG.provider) || {};
   $('ver').textContent = 'v' + (CFG.version || '?');
   document.title = 'Suno Studio v' + (CFG.version || '?');
-  let w = '';
-  if(!CFG.has_key) w = 'No API key set for '+(p.label||'this provider')+'. Open Settings to add one.';
-  else if(!CFG.exact_lyrics) w = p.label+" can't sing your lyrics verbatim — it only takes a free-text prompt, so Suno will paraphrase. Switch to sunoapi.org for exact lyrics.";
-  $('warn').innerHTML = w ? `<div class="banner">${w}</div>` : '';
+  const notices=[];
+  if(!CFG.has_key) notices.push('Add a song-provider API key in Settings to make your first song.');
+  else if(!CFG.exact_lyrics) notices.push(p.label+" may paraphrase submitted lyrics. Choose a provider with exact-lyrics support if needed.");
+  if(!CFG.ffmpeg || (CFG.ffmpeg_missing||[]).length)
+    notices.push('Install FFmpeg with subtitles and drawtext support to make videos. See SETUP.md in your downloaded folder.');
+  $('warn').innerHTML = notices.map(message=>`<div class="banner">${esc(message)}</div>`).join('');
 }
 
 async function generate(){
+  const deliveryMode = $('manual_delivery_mode').value || 'none';
   const body = {
     title: $('title').value, style: $('style').value, lyrics: $('lyrics').value,
-    infographic: $('infographic').value,
-    tagline: $('sprint').value, recipient: $('recip').value,
-    model: $('model').value, instrumental: $('instrumental').checked,
-    negativeTags: $('neg').value, vocalGender: $('gender').value,
-    styleWeight: $('sw').value || null, weirdnessConstraint: $('wc').value || null,
+    delivery_mode: deliveryMode,
+    recipient: deliveryMode==='email' ? $('manual_recipient').value : '',
+    slack_channel_id: deliveryMode==='slack' ? $('manual_slack_channel').value : '',
   };
   $('go').disabled = true;
-  const r = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  $('go').disabled = false;
-  if(j.error){ alert(j.error); return; }
-  refresh();
+  try {
+    const r = await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j = await r.json();
+    if(j.error){ alert(j.error); return; }
+    refresh();
+  } catch(e) { alert('Could not start song generation: '+e.message); }
+  finally { $('go').disabled = false; }
+}
+
+function syncManualDeliveryFields(){
+  const mode=$('manual_delivery_mode').value;
+  const target=$('manual_delivery_target');
+  if(mode==='email') target.innerHTML='<label for="manual_recipient">Recipient</label><input type="text" id="manual_recipient" placeholder="name@example.com">';
+  else if(mode==='slack') target.innerHTML='<label for="manual_slack_channel">Slack Channel ID</label><input type="text" id="manual_slack_channel" placeholder="C0123456789">';
+  else target.innerHTML='<label>Destination</label><div class="hint" style="padding:10px 0">No delivery destination needed.</div>';
 }
 
 function esc(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -5265,14 +6986,18 @@ function renderInbox(inbox, watch){
   $('inbox').innerHTML = INBOX.map(it=>{
     const f = it.form || {};
     const preview = (f.instrumental ? '(instrumental)' : (f.lyrics||'')).split('\n').slice(0,8).join('\n');
+    const display = f.display_lyrics ? f.display_lyrics.split('\n').slice(0,8).join('\n') : '';
     const bits = [f.style||'no style', f.model||'default model'];
     if(f.tagline) bits.unshift(f.tagline);
-    if(f.recipient) bits.push('-> '+f.recipient);
+    if(f.delivery_mode==='email') bits.push('Email → '+(f.recipient||'recipient needed'));
+    else if(f.delivery_mode==='slack') bits.push('Slack → '+(f.slack_channel_id||'channel needed'));
     if(f.instrumental) bits.push('instrumental');
     return `<div class="ib">
       <h3>${esc(f.title||'Untitled')}</h3>
       <div class="src">${esc(it.from||'')}${it.received?' · '+esc(it.received):''} · ${esc(bits.join(' · '))}</div>
-      <pre>${esc(preview)}</pre>
+      <pre>${esc(preview)}</pre>${display?`<div class="src">Onscreen lyrics</div><pre>${esc(display)}</pre>`:''}
+      ${it.validation_error?`<div class="banner">${esc(it.validation_error)}</div>`:''}
+      ${f.delivery_error?`<div class="banner">${esc(f.delivery_error)}</div>`:''}
       <div class="btns">
         <button class="small" onclick="approve('${it.id}')">Generate Song</button>
         <button class="ghost small" onclick="dismiss('${it.id}')">Dismiss</button>
@@ -5281,12 +7006,15 @@ function renderInbox(inbox, watch){
 }
 
 async function approve(id){
-  await fetch('/api/inbox/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const result=await (await fetch('/api/inbox/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})).json();
+  if(result.error) alert(result.error);
   refresh();
 }
 async function approveAll(){
   if(INBOX.length>1 && !confirm(`Generate all ${INBOX.length} requests? Each one costs credits.`)) return;
-  await fetch('/api/inbox/approve_all',{method:'POST'}); refresh();
+  const result=await (await fetch('/api/inbox/approve_all',{method:'POST'})).json();
+  if(result.errors?.length) alert(result.errors.join('\n'));
+  refresh();
 }
 async function dismiss(id){
   await fetch('/api/inbox/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
@@ -5296,12 +7024,11 @@ function edit(id){
   const it = INBOX.find(x=>x.id===id); if(!it) return;
   const f = it.form || {};
   $('title').value = f.title||''; $('style').value = f.style||'';
-  $('infographic').value = f.infographic||'';
-  $('sprint').value = f.tagline||'';
-  $('recip').value = f.recipient||'';
-  $('lyrics').value = f.lyrics||''; $('instrumental').checked = !!f.instrumental;
-  $('neg').value = f.negativeTags||''; $('gender').value = f.vocalGender||'';
-  if(f.model && [...$('model').options].some(o=>o.value===f.model)) $('model').value = f.model;
+  $('lyrics').value = f.lyrics||'';
+  $('manual_delivery_mode').value = f.delivery_mode||'none';
+  syncManualDeliveryFields();
+  if(f.delivery_mode==='email' && $('manual_recipient')) $('manual_recipient').value=f.recipient||'';
+  if(f.delivery_mode==='slack' && $('manual_slack_channel')) $('manual_slack_channel').value=f.slack_channel_id||'';
   dismiss(id);
   window.scrollTo({top:0,behavior:'smooth'});
   $('title').focus();
@@ -5310,14 +7037,25 @@ function edit(id){
 // Repainting the queue would tear down any <audio> that's mid-playback, so
 // only touch the DOM when the markup actually changed AND nothing is playing.
 let lastActiveHtml = '', lastFinishedHtml = '', pendingJobsHtml = null;
-const COLLAPSED_JOBS = new Set();
+// Job markup refreshes every few seconds. Keep each native <details> state
+// separately so a refresh cannot reopen a section the user just collapsed.
+const JOB_SECTION_OPEN = new Map();
 
-function rememberJobState(id, el){
-  if(el.open) COLLAPSED_JOBS.delete(id); else COLLAPSED_JOBS.add(id);
+function snapshotJobSectionState(){
+  document.querySelectorAll('details[data-job-section]').forEach(el=>{
+    JOB_SECTION_OPEN.set(el.dataset.jobSection, el.open);
+  });
+}
+
+function sectionAttrs(job, section, initiallyOpen){
+  const key=`${job}:${section}`;
+  const open=JOB_SECTION_OPEN.has(key) ? JOB_SECTION_OPEN.get(key) : initiallyOpen;
+  return ` data-job-section="${key}"${open?' open':''}`;
 }
 
 function mediaBusy(el){
-  return [...el.querySelectorAll('audio,video')].some(m => !m.paused && !m.ended && m.currentTime > 0);
+  return !!el.querySelector('[data-subtitle-editor][data-active="true"]') ||
+    [...el.querySelectorAll('audio,video')].some(m => !m.paused && !m.ended && m.currentTime > 0);
 }
 
 function paintJobs(activeHtml, finishedHtml){
@@ -5335,6 +7073,30 @@ async function pipelineAction(job, action, prompt, fields, selected){
     body:JSON.stringify({job,action,prompt,fields,selected})})).json();
   if(r.error) alert(r.error); refresh();
 }
+function toggleImageMenu(job, button){
+  const menu=$('image_menu_'+job), opening=menu.hidden;
+  document.querySelectorAll('.image-action-menu').forEach(m=>m.hidden=true);
+  menu.hidden=!opening;
+  button.setAttribute('aria-expanded',String(opening));
+}
+async function uploadPipelineImage(job, input){
+  const image=input.files && input.files[0];
+  if(!image) return;
+  const data=new FormData();
+  data.append('job',job);
+  data.append('fields',JSON.stringify(gateFields(job)));
+  data.append('image',image);
+  input.disabled=true;
+  try {
+    const response=await fetch('/api/job/upload-image',{method:'POST',body:data});
+    const result=await response.json();
+    if(result.error) alert(result.error);
+  } catch(e) {
+    alert('Could not upload image: '+e.message);
+  } finally {
+    input.value=''; input.disabled=false; refresh();
+  }
+}
 async function cancelAndRemove(job){
   if(!confirm('Cancel this job and remove it from Suno Studio? Generated files will be moved to the recoverable Rejects folder.')) return;
   await pipelineAction(job,'cancel_remove');
@@ -5346,9 +7108,34 @@ function gateFields(job){
     lyrics:value('lyrics'),infographic:value('infographic')};
 }
 function deliveryFields(job){
-  const fields=gateFields(job), recipient=$(fieldId(job,'recipient'))?.value;
-  if(recipient !== undefined) fields.recipient=recipient;
+  const fields=gateFields(job), mode=$(fieldId(job,'delivery_mode'))?.value||'none';
+  fields.delivery_mode=mode;
+  fields.recipient=mode==='email'?($(fieldId(job,'recipient'))?.value||''):'';
+  fields.slack_channel_id=mode==='slack'?($(fieldId(job,'slack_channel_id'))?.value||''):'';
   return fields;
+}
+function deliveryModeChanged(job){
+  const mode=$(fieldId(job,'delivery_mode'))?.value||'none';
+  const emailBox=$(fieldId(job,'email_target')), slackBox=$(fieldId(job,'slack_target'));
+  if(emailBox) emailBox.hidden=mode!=='email';
+  if(slackBox) slackBox.hidden=mode!=='slack';
+}
+function deliveryEditor(j){
+  const id=j.id, f=j.current_fields||{}, mode=f.delivery_mode||'none';
+  const invalid=!['none','email','slack'].includes(mode);
+  const options=`${invalid?`<option value="${esc(mode)}" selected>Invalid choice: ${esc(mode)}</option>`:''}<option value="none" ${mode==='none'?'selected':''}>None</option><option value="slack" ${mode==='slack'?'selected':''}>Slack</option><option value="email" ${mode==='email'?'selected':''}>Email</option>`;
+  return `<div class="delivery-review"><label>Delivery</label><select id="${fieldId(id,'delivery_mode')}" onchange="deliveryModeChanged('${id}')">${options}</select><div id="${fieldId(id,'email_target')}" ${mode==='email'?'':'hidden'}><label>Recipient</label><input type="text" id="${fieldId(id,'recipient')}" value="${esc(f.recipient||'')}" placeholder="name@example.com"></div><div id="${fieldId(id,'slack_target')}" ${mode==='slack'?'':'hidden'}><label>Slack Channel ID</label><input type="text" id="${fieldId(id,'slack_channel_id')}" value="${esc(f.slack_channel_id||'')}" placeholder="C0123456789"></div><div class="hint">A delivery problem keeps the approved local MP4 and can be corrected here without rendering again.</div></div>`;
+}
+async function retryDelivery(job, status, mode){
+  const fields=deliveryFields(job);
+  if(status==='needs_review' && fields.delivery_mode!=='none'){
+    const warning=mode==='slack'
+      ?'Slack may already have received this file. Retrying could post a duplicate.'
+      :'The email may already have been sent. Retrying could send it twice.';
+    if(!confirm(warning+' Retry anyway?')) return;
+    fields.confirm_uncertain_delivery=true;
+  }
+  await pipelineAction(job,'retry_delivery',null,fields);
 }
 function saveGateFields(job){ pipelineAction(job,'save_fields',null,gateFields(job)); }
 function selectVariant(job,stage,id){ pipelineAction(job,'save_fields',null,null,{stage,id}); }
@@ -5367,6 +7154,58 @@ function toggleSongEditor(id, btn){
   editor.style.display=opening?'block':'none';
   btn.textContent=opening?'Hide Song Details':'Edit Song Details';
 }
+async function openSubtitleEditor(job){
+  const editor=$('subtitle_editor_'+job), text=$('subtitle_text_'+job), state=$('subtitle_state_'+job);
+  if(editor.dataset.active==='true'){
+    editor.dataset.active='false'; editor.hidden=true; refresh(); return;
+  }
+  state.textContent='Converting word timings…';
+  try {
+    const r=await (await fetch('/api/subtitles?job='+encodeURIComponent(job))).json();
+    if(r.error) throw new Error(r.error);
+    text.value=r.text||'';
+    editor.dataset.active='true'; editor.hidden=false;
+    state.textContent=(r.edited?'Editing saved word timings':'Editing automatic word timings')+
+      ` · ${r.revision||0} rendered revision(s)`;
+  } catch(e) {
+    state.textContent=''; alert('Could not load subtitles: '+e.message);
+  }
+}
+async function saveSubtitleEditor(job){
+  const state=$('subtitle_state_'+job), text=$('subtitle_text_'+job);
+  state.textContent='Validating and saving…';
+  try {
+    const r=await (await fetch('/api/subtitles/save',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job,text:text.value})})).json();
+    if(r.error) throw new Error(r.error);
+    state.textContent=`Saved ${r.words} word timings. Regenerate to preview the timing.`;
+    const editor=document.getElementById('subtitle_editor_'+job);
+    editor?.querySelector('[onclick^="resetSubtitleEditor"]').removeAttribute('disabled');
+    return true;
+  } catch(e) { state.textContent=''; alert('Could not save subtitles: '+e.message); return false; }
+}
+async function regenerateSubtitles(job){
+  const editor=$('subtitle_editor_'+job);
+  if(editor?.dataset.active==='true' && !(await saveSubtitleEditor(job))) return;
+  if(editor){ editor.dataset.active='false'; editor.hidden=true; }
+  await pipelineAction(job,'rerender_subtitles');
+}
+async function resetSubtitleEditor(job){
+  if(!confirm('Discard your saved subtitle timing edits and restore the automatic baseline?')) return;
+  const state=$('subtitle_state_'+job);
+  try {
+    const r=await (await fetch('/api/subtitles/reset',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job})})).json();
+    if(r.error) throw new Error(r.error);
+    $('subtitle_editor_'+job).dataset.active='false';
+    refresh();
+  } catch(e) { state.textContent=''; alert('Could not reset subtitles: '+e.message); }
+}
+function subtitleEditor(j){
+  if(j.status!=='paused_video' || !j.subtitle_generated_path) return '';
+  const id=j.id, edited=j.subtitle_effective_path===j.subtitle_override_path;
+  return `<details${sectionAttrs(id,'subtitles',false)}><summary>Word Timing Editor</summary><div class="hint">Edit one word at a time using absolute timestamps—no ASS <code>{\\kf…}</code> math. Keep IDs and text unchanged; set a start such as <code>00:00:26.000</code>, then regenerate to preview.</div><div class="btns" style="margin-top:10px"><button class="ghost small" onclick="openSubtitleEditor('${id}')">Edit Word Timings</button><button class="ghost small" onclick="regenerateSubtitles('${id}')">Regenerate With Timing Edits</button></div><div id="subtitle_editor_${id}" data-subtitle-editor data-active="false" hidden><label>Timing TSV ${edited?'· saved manual timing':'· automatic baseline'}</label><textarea id="subtitle_text_${id}" spellcheck="false" style="min-height:360px"></textarea><div class="btns" style="margin-top:10px"><button class="small" onclick="saveSubtitleEditor('${id}')">Save Word Timings</button><button class="ghost small" onclick="resetSubtitleEditor('${id}')" ${edited?'':'disabled'}>Reset To Automatic</button><button class="ghost small" onclick="openSubtitleEditor('${id}')">Close</button><span class="hint" id="subtitle_state_${id}" style="margin:0"></span></div></div></details>`;
+}
 function openImagePreview(src, label){
   $('imageviewer_img').src=src;
   $('imageviewer_label').textContent=label||'Selected Image';
@@ -5381,31 +7220,42 @@ function imagePicker(j){
   const currentUrl=current.file?`/file?p=${encodeURIComponent(current.file)}`:'';
   const gallery=(j.image_variants||[]).map((v,i)=>v.file?`<button type="button" class="image-thumb ${v.id===selected?'selected':''}" ${locked?'disabled':''} aria-label="Select Image ${i+1}" onclick="selectVariant('${j.id}','image','${v.id}')"><img alt="Image ${i+1}" src="/file?p=${encodeURIComponent(v.file)}"></button>`:'').join('');
   const preview=currentUrl?`<div class="image-selected-preview"><img alt="Selected Image ${currentIndex+1}" src="${currentUrl}" onclick="openImagePreview(this.src,this.alt)"><span class="image-preview-label">Image ${currentIndex+1} of ${(j.image_variants||[]).length} · Click To Enlarge</span></div>`:'';
-  return `<details open><summary>Image Generation · ${j.image_regenerations||0} Additional Images</summary><label>Selected Image</label><select id="pi_${j.id}" ${locked?'disabled':''} onchange="selectVariant('${j.id}','image',this.value)">${opts}</select>${locked?'<div class="hint">Locked to the gallery image used by this video.</div>':''}${preview}<div class="image-variants" aria-label="Image Options">${gallery}</div><label>Image Prompt</label><textarea id="pp_${j.id}" style="min-height:150px">${esc(current.prompt||'')}</textarea></details>`;
+  return `<details${sectionAttrs(j.id,'image',true)}><summary>Image Generation · ${j.image_regenerations||0} Additional Images</summary><label>Selected Image</label><select id="pi_${j.id}" ${locked?'disabled':''} onchange="selectVariant('${j.id}','image',this.value)">${opts}</select>${locked?'<div class="hint">Locked to the gallery image used by this video.</div>':''}${preview}<div class="image-variants" aria-label="Image Options">${gallery}</div><label>Image Prompt</label><textarea id="pp_${j.id}" style="min-height:150px">${esc(current.prompt||'')}</textarea></details>`;
 }
 function pipelineButtons(j, songTracks, videoTracks, progress){
   if(!j.pipeline) return '';
   const id = j.id;
-  const songs=`<details open><summary>Song Generation</summary>${songTracks}${songPicker(j)}${songEditor(j)}</details>`;
+  const songs=`<details${sectionAttrs(id,'song',true)}><summary>Song Generation</summary>${songTracks}${songPicker(j)}${songEditor(j)}</details>`;
   const images=imagePicker(j);
-  const video=(j.stage==='video'||videoTracks) ? `<details open><summary>Video Generation</summary>${progress}<div class="hint" style="margin-top:8px">${esc(j.message||'')}</div>${videoTracks}</details>` : '';
+  const video=(j.stage==='video'||videoTracks) ? `<details${sectionAttrs(id,'video',true)}><summary>Video Generation</summary>${progress}<div class="hint" style="margin-top:8px">${esc(j.message||'')}</div>${videoTracks}</details>` : '';
   const fields=`gateFields('${id}')`;
   const newSong=`<button class="ghost small" onclick="pipelineAction('${id}','resubmit_song',null,${fields})">Generate New Song</button>`;
   const anotherImage=`<button class="ghost small" onclick="pipelineAction('${id}','regenerate_image',document.getElementById('pp_${id}')?.value,${fields})">Generate Another Image</button>`;
   const cancel=`<button class="ghost small" onclick="cancelAndRemove('${id}')">Cancel And Remove</button>`;
+  const imageAction=`<div class="image-action"><button class="small image-action-main" ${j.stale_song?'disabled':''} onclick="pipelineAction('${id}','approve_song',null,${fields})">Generate Image</button><button type="button" class="small image-action-caret" ${j.stale_song?'disabled':''} aria-label="More image options" aria-expanded="false" onclick="toggleImageMenu('${id}',this)">▾</button><div id="image_menu_${id}" class="image-action-menu" hidden><button type="button" class="ghost small" onclick="document.getElementById('image_upload_${id}').click()">Upload Image</button></div><input id="image_upload_${id}" type="file" accept="image/png,image/jpeg,image/webp" hidden onchange="uploadPipelineImage('${id}',this)"></div>`;
   const running=(j.status==='queued'||j.status==='running'||j.status==='submitting');
   const stop=running?`<div class="btns" style="margin-top:10px"><button class="ghost small" onclick="pipelineAction('${id}','interrupt')">Interrupt</button>${cancel}</div>`:'';
-  if(j.status==='paused_song') return songs+`<div class="btns" style="margin-top:10px"><button class="small" ${j.stale_song?'disabled':''} onclick="pipelineAction('${id}','approve_song',null,${fields})">Generate Image</button>${newSong}${cancel}</div>`;
+  if(j.status==='paused_song') return songs+`<div class="btns" style="margin-top:10px">${imageAction}${newSong}${cancel}</div>`;
   if(j.status==='paused_image') return songs+images+`<div class="btns" style="margin-top:10px"><button class="small" onclick="pipelineAction('${id}','approve_image',null,${fields},{stage:'image',id:document.getElementById('pi_${id}').value})">Generate Video</button>${anotherImage}${newSong}${cancel}</div>`;
   if(j.status==='error' && j.stage==='song' && j.task_id) return songs+`<div class="btns" style="margin-top:10px"><button class="small" onclick="pipelineAction('${id}','retry_song_poll')">Retry Provider Status</button>${newSong}${cancel}</div>`;
   if(j.status==='error' && j.stage==='image') return songs+images+`<div class="btns" style="margin-top:10px">${anotherImage}${newSong}${cancel}</div>`;
   if(j.status==='paused_video') {
-    const recipient=esc((j.current_fields||{}).recipient||'');
-    return songs+images+video+`<div class="delivery-review"><label>Delivery Email <span class="hint">(review or change before publishing)</span></label><input type="email" id="${fieldId(id,'recipient')}" value="${recipient}" placeholder="name@example.com"><div class="hint">The approved video is routed using this email after you publish it.</div></div><div class="btns" style="margin-top:10px"><button class="small" onclick="pipelineAction('${id}','approve_video',null,deliveryFields('${id}'))">Publish Final</button>${anotherImage}${newSong}${cancel}</div>`;
+    return songs+images+video+subtitleEditor(j)+deliveryEditor(j)+`<div class="btns" style="margin-top:10px"><button class="small" onclick="pipelineAction('${id}','approve_video',null,deliveryFields('${id}'))">Approve Video</button><button class="ghost small" onclick="pipelineAction('${id}','back_image')">Back to Image</button>${cancel}</div>`;
   }
+
   if(running && j.stage==='image') return songs+images+`<div class="hint" style="margin-top:10px"><span class="spin"></span>Generating Another Image — Existing Options Remain Available.</div>`+stop;
   if(running && j.stage==='video') return songs+images+video+stop;
-  if(j.status==='error') return songs+images+video+`<div class="btns" style="margin-top:10px">${cancel}</div>`;
+  if(j.status==='completed' && j.delivery_status && j.delivery_status!=='not_requested'){
+    const deliveryState=j.delivery_status==='sent'?'Delivery sent':
+      j.delivery_status==='needs_review'?'Delivery needs your review':
+      j.delivery_status==='queued'||j.delivery_status==='sending'?'Sending delivery…':'Delivery error';
+    const detail=j.delivery_error?`<div class="banner" style="margin-top:10px">${esc(j.delivery_error)}</div>`:
+      (j.delivery_receipt&&j.delivery_receipt.permalink?`<div class="hint"><a href="${esc(j.delivery_receipt.permalink)}" target="_blank" rel="noreferrer">Open Slack file</a></div>`:'');
+    const retry=['error','needs_review'].includes(j.delivery_status)
+      ?`<div style="margin-top:8px">${deliveryEditor(j)}<button class="small" onclick="retryDelivery('${id}','${j.delivery_status}','${j.delivery_mode}')">Retry Delivery</button></div>`:'';
+    return songs+images+video+`<div class="delivery-result"><b>${esc(deliveryState)}</b>${detail}${retry}</div>`;
+  }
+  if(j.status==='error') return songs+images+video+`<div class="btns" style="margin-top:10px">${j.stage==='video'?`<button class="small" onclick="pipelineAction('${id}','retry_video')">Retry video</button>`:''}${cancel}</div>`;
   return songs+images+video+stop;
 }
 
@@ -5426,6 +7276,7 @@ function collapsedMessage(j){
 }
 
 async function refresh(){
+  snapshotJobSectionState();
   const {jobs, inbox, watch, alerts} = await (await fetch('/api/jobs')).json();
   const ab=$('alertbar');
   if(alerts && alerts.length){ ab.style.display='block';
@@ -5462,8 +7313,7 @@ async function refresh(){
     const body = j.pipeline
       ? pipelineButtons(j,songTracks,videoTracks,progress)
       : progress+songTracks+videoTracks;
-    const open = COLLAPSED_JOBS.has(j.id) ? '' : ' open';
-    return `<details class="job"${open} ontoggle="rememberJobState('${j.id}',this)">
+    return `<details class="job"${sectionAttrs(j.id,'job',true)}>
       <summary><h3>${esc(j.title)}${badge}</h3>
       <div class="meta">${run?'<span class="spin"></span>':''}${esc(collapsedMessage(j))}</div></summary>
       <div class="job-body">
@@ -5503,6 +7353,22 @@ async function quitApp(force){
 }
 
 const dlg = $('dlg');
+const bugdlg = $('bugdlg');
+function openBugReport(){ $('bug_result').textContent=''; bugdlg.showModal(); previewBugReport(); }
+async function previewBugReport(){
+  const body={stage:$('bug_stage').value,error_summary:$('bug_summary').value};
+  const r=await (await fetch('/api/bug/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  $('bug_preview').textContent=r.preview?JSON.stringify(r.preview,null,2):(r.error||'Preview unavailable');
+}
+async function sendBugReport(){
+  const button=$('bug_send'); button.disabled=true;
+  const body={stage:$('bug_stage').value,error_summary:$('bug_summary').value};
+  try{
+    const r=await (await fetch('/api/bug/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+    $('bug_result').textContent=r.ok?`Report sent. Reference: ${r.reference}`:(r.error||'Report failed');
+  }catch(e){ $('bug_result').textContent='Report could not be sent. Check your connection.'; }
+  button.disabled=false;
+}
 function openSettings(){
   $('s_provider').innerHTML = CFG.providers.map(p=>`<option value="${p.id}">${p.label}</option>`).join('');
   $('s_provider').value = CFG.provider;
@@ -5515,6 +7381,9 @@ function openSettings(){
   $('s_gp').value = '';
   $('s_gpstate').textContent = CFG.gmail_pw_set ? 'An app password is already saved.'
     : 'Needs 2-Step Verification, then myaccount.google.com/apppasswords';
+  $('s_slack_token').value = '';
+  $('s_slack_state').textContent = CFG.slack_token_set ? 'A Slack bot token is already saved.'
+    : 'Optional for local Slack delivery. Cloud delivery uses the token stored by cloud setup.';
   $('s_ds').value = CFG.default_style||'';
   $('s_ws').value = CFG.watch_seconds||60;
   $('s_mc').value = CFG.max_concurrent||2;
@@ -5527,6 +7396,11 @@ function openSettings(){
   $('s_as').value = CFG.allowed_senders||'';
   $('s_test').textContent = '';
   $('s_vh').value = String(CFG.video_height||1080);
+  $('s_backend').value = CFG.render_backend||'local';
+  $('s_backend').querySelector('option[value="aws"]').disabled = !CFG.aws_ready;
+  $('s_backend_state').textContent = CFG.aws_ready
+    ? `AWS configured in ${CFG.aws_region}. Sign in with the saved AWS profile before rendering; cloud jobs are billed per task.`
+    : 'Optional: run setup_aws.py to enable pay-per-use parallel rendering.';
   $('s_vis').value = CFG.visualizer||'bars';
   $('s_align').value = CFG.lyric_aligner||'section';
   $('s_repair').value = CFG.hybrid_repair||'local';
@@ -5549,8 +7423,8 @@ function openSettings(){
   renderFragments();
   $('s_av').checked = !!CFG.auto_video;
   const miss = CFG.ffmpeg_missing || [];
-  $('s_ffstate').textContent = !CFG.ffmpeg ? 'ffmpeg not installed - run  brew install ffmpeg-full'
-    : miss.length ? ('ffmpeg found, but missing: '+miss.join(', ')+' - run  brew install ffmpeg-full  (the plain ffmpeg formula lacks libass/freetype)')
+  $('s_ffstate').textContent = !CFG.ffmpeg ? 'FFmpeg is missing. See SETUP.md to install and check it.'
+    : miss.length ? ('FFmpeg is missing: '+miss.join(', ')+'. See SETUP.md for a compatible build.')
     : ('ffmpeg found at '+CFG.ffmpeg);
   $('s_ffstate').style.color = (!CFG.ffmpeg || miss.length) ? 'var(--warn)' : 'var(--dim)';
   $('s_path').textContent = 'Suno Studio v' + (CFG.version||'?') + '  ·  settings stored in ' + CFG.config_path;
@@ -5608,7 +7482,8 @@ async function saveSettings(){
                 gate_image:$('s_gate_image').checked, gate_video:$('s_gate_video').checked,
                 suno_single_clip:$('s_oneclip').checked, image_prompt_fragments:readFragments(),
                 auto_generate:$('s_auto').checked, allowed_senders:$('s_as').value,
-                video_height:$('s_vh').value, visualizer:$('s_vis').value, video_dir:$('s_vd').value, alerts_enabled:$('s_al').checked,
+                video_height:$('s_vh').value, render_backend:$('s_backend').value,
+                visualizer:$('s_vis').value, video_dir:$('s_vd').value, alerts_enabled:$('s_al').checked,
                 lyric_aligner:$('s_align').value,
                 hybrid_repair:$('s_repair').value,
                 kie_low_credits:$('s_alk').value, bg_source:$('s_bg').value, art_title:$('s_arttitle').checked,
@@ -5618,13 +7493,16 @@ async function saveSettings(){
                 openai_image_model:$('s_im').value,
                 auto_video:$('s_av').checked};
   if($('s_gp').value.trim()) body.gmail_app_password = $('s_gp').value.trim();
+  if($('s_slack_token').value.trim()) body.slack_bot_token = $('s_slack_token').value.trim();
   if($('s_ok').value.trim()) body.openai_key = $('s_ok').value.trim();
   if($('s_tdt').value.trim()) body.todoist_token = $('s_tdt').value.trim();
   if($('s_key').value.trim()) body[id+'_key'] = $('s_key').value.trim();
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const saved = await (await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if(saved.error){ alert(saved.error); return; }
   dlg.close(); await loadConfig();
 }
 
+syncManualDeliveryFields();
 loadConfig().then(refresh);
 setInterval(refresh, 3000);
 </script></body></html>

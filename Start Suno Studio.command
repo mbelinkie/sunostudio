@@ -12,7 +12,12 @@ if [ ! -f "suno_studio.py" ]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
+PYTHON=python3
+if [ -x ".venv/bin/python3" ]; then
+  PYTHON=".venv/bin/python3"
+fi
+
+if ! command -v "$PYTHON" >/dev/null 2>&1 && [ ! -x "$PYTHON" ]; then
   echo "Python 3 isn't installed yet."
   echo
   echo "Run this once, click Install when macOS asks, then try again:"
@@ -22,7 +27,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-python3 suno_studio.py
+"$PYTHON" suno_studio.py
 
 echo
 echo "Suno Studio stopped."

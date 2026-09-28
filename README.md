@@ -1,70 +1,101 @@
 # Suno Studio
 
-Suno Studio is a local macOS-friendly web app for generating songs from
-authored lyrics and rendering timed lyric videos. It runs on Python's standard
-library: start it locally, enter the credentials for a supported generation
-provider in its Settings screen, and keep the credentials in your local config
-rather than the repository.
+Suno Studio is a local-first app for creating songs from your lyrics and making
+timed lyric videos. Your approvals and permanent copy of each finished MP4
+stay on your computer. Song and optional artwork requests go to the provider
+you choose. Local video rendering is the default; optional AWS ECS Fargate
+rendering can encode several videos at once.
 
-> This is an independent project. It is not affiliated with or endorsed by
-> Suno, OpenAI, Google, or any generation-provider API.
+> Suno Studio is an independent project. It is not affiliated with or endorsed
+> by Suno, OpenAI, Google, or any song-generation provider.
 
-## What it does
+## Download and start
 
-- generates custom-lyric or instrumental tracks through configured providers;
-- can read song requests from a Gmail label in review-first mode;
-- fetches/caches word timings and maps them back to the authored lyric lines;
-- renders karaoke-style lyric videos with ffmpeg;
-- includes subtitle and video diagnostic tools.
+1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
+   Download `SunoStudio-6.0-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0-source.zip` for the source and Windows launcher.
+2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
+   [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
+   `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
+   [setup guide](SETUP.md) has checks for macOS and Windows.
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.app** to Applications
+   and double-click it. On Windows, extract the full source ZIP folder
+   and double-click **Start Suno Studio.bat** inside it. Keep the launcher
+   beside `suno_studio.py`.
+4. Open <http://127.0.0.1:8765> if your browser does not open automatically.
+   In Settings, choose a song provider and paste its API key. Use **Create a
+   Song** with delivery set to **None** for a first run.
 
-## Quick start
+The macOS app archive is not signed or notarized. If Gatekeeper blocks it,
+control-click the app, choose **Open**, and confirm the prompt. Both packages
+require Python 3.9 or newer and FFmpeg; the macOS app bundle does not include
+those runtimes.
 
-Requirements: macOS or another system with Python 3.9+.
+The local app needs no Python packages or cloud account. Gmail, OpenAI, AWS,
+and Slack are optional. See [SETUP.md](SETUP.md) for optional services and
+troubleshooting.
 
-```bash
-python3 suno_studio.py
-```
+## Creation and delivery
 
-Then open <http://127.0.0.1:8765>. API keys, mail credentials, output paths,
-and job state are stored outside the checkout in `~/.suno_studio/` and are not
-part of this repository.
+- Create a song from a title, style, and lyrics, then review the generated
+  song, artwork, and video before approval.
+- Keep the finished MP4 locally, send it to a Slack channel, or email a private
+  download link that expires after three days. Delivery happens only after
+  video approval. Fix delivery details and retry a failed send without
+  regenerating the song or video.
+- Gmail intake is optional and review-first. Email requests can include
+  `Delivery: Slack`, `Delivery: Email`, or `Delivery: None`, plus `Slack
+  Channel ID: C…` or `Recipient: name@example.com` as needed. An omitted
+  delivery choice means **None**; a Slack channel is never guessed.
+- The explicit bug-report form previews the limited report before submission.
+  It sends the app version, platform, stage, and a scrubbed error summary to
+  the maintainer's Sentry project and returns a reference ID. It does not
+  attach lyrics, media, credentials, or automatic telemetry.
 
-On macOS, `Start Suno Studio.command` can be double-clicked instead. For lyric
-video rendering, install an ffmpeg build with the `subtitles` and `drawtext`
-filters, then use **Diagnose Video.command** to verify it.
+## Optional AWS rendering
 
-## Lyric alignment
+Local rendering works without an AWS account. If you opt in, setup creates
+resources in your AWS account and uses your AWS CLI SSO profile; Suno Studio
+does not store AWS access keys. AWS rendering is selected explicitly in
+Settings after setup, and local rendering remains the default.
+
+The render task uses 4 vCPU and 8 GiB, with up to 25 concurrent renders when
+your Fargate quota allows. At published Linux/x86 rates in us-east-1, five
+minutes of render-task compute is about $0.016; actual cost varies by region
+and runtime. S3 storage and requests, ECR image storage, CodeBuild, CloudWatch
+Logs, and network transfer can add charges. Song and artwork providers charge
+separately. See [SETUP.md](SETUP.md) for setup, retention, and cleanup details.
+
+## Lyrics and diagnostics
 
 The default section aligner treats authored lyric line breaks as the source of
-truth and uses timed provider words only for timestamps. It retains a legacy
-baseline and has an optional local stable-ts hybrid mode for bounded repairs.
+truth and uses timed provider words for timestamps. The legacy aligner remains
+available, as does the optional local stable-ts hybrid mode.
 
 ```bash
 python3 -m unittest -v test_lyric_alignment.py test_app_reliability.py
 python3 subs_doctor.py /path/to/song.words.json --no-frames
 ```
 
-See [lyrics-parsing.md](lyrics-parsing.md) for the alignment design and
-diagnostics.
+See [lyrics-parsing.md](lyrics-parsing.md) for alignment details. To diagnose
+video tools, macOS users can run **Diagnose Video.command**; Windows users can
+run `Check Video Tools.ps1` in PowerShell. The Windows check verifies that
+FFmpeg and ffprobe are available and that required filters are listed. A
+successful check does not guarantee every codec, font, or render will work.
 
-## Optional local stable-ts alignment
+For optional local stable-ts alignment on macOS, run
+**Install Local Lyric Alignment.command**, then choose **Local stable-ts
+hybrid** in Settings.
 
-`stable_ts_hybrid.py` is intentionally separate from the standard-library app.
-On the supported macOS setup, double-click `Install Local Lyric Alignment.command`
-to create its isolated runtime, then select **Local stable-ts hybrid** in the
-app's Settings.
+## Data and security
 
-## Repository policy
+Settings, credentials, and job state are stored under `~/.suno_studio/` on
+macOS/Linux and `%USERPROFILE%\.suno_studio\` on Windows. The files are local
+to your account; do not commit, share, or place them in a public issue. Gmail
+uses a Google app password, not your regular account password. AWS credentials
+come from your AWS CLI SSO profile; see [SECURITY.md](SECURITY.md) for
+reporting guidance.
 
-Only source, safe documentation, and tests are versioned. The following are
-intentionally excluded: generated applications and zip files, media and
-artwork, subtitle diagnostics, sample songs, local configuration, historical
-backups, and organization-specific integration material.
+## License
 
-No open-source license has been selected yet. Until one is added, the code is
-shared publicly for viewing but no permission to reuse it is granted.
-
-## Security
-
-Please do not file credentials or private media in issues. See
-[SECURITY.md](SECURITY.md) for reporting guidance.
+Suno Studio is released under the [MIT License](LICENSE).
