@@ -111,6 +111,7 @@ DEFAULT_CONFIG = {
     "art_title": True,                  # let the artwork carry the title
     "video_crf": 24,                    # lower = better quality, bigger file
     "render_backend": "local",         # "local" | "aws"; opt in after AWS setup
+    "aws_render_size": "large",         # measured fastest task; can change without rebuilding
 }
 
 # Prompt assembly stays in code.  These values are deliberately English-only
@@ -900,6 +901,7 @@ def aws_settings():
         "security_group": CONFIG.get("aws_security_group"),
         "link_url": CONFIG.get("aws_link_url"),
         "link_secret": CONFIG.get("aws_link_secret"),
+        "render_size": CONFIG.get("aws_render_size", "large"),
     }
 
 
@@ -3102,18 +3104,19 @@ def display_karaoke_groups(groups, lyrics_text, display_lyrics, alignment=None,
             result.append(group)
             continue
         items = [item for row in group for item in row]
-        words = pair[1].split()
-        # Most Suno splits preserve the same letters even when punctuation and
-        # token boundaries change (S-A-T -> S, A, T). Match those boundaries.
-        if _chars(join_words([item["w"] for item in items])) == _chars(pair[0]) and all(
-                _chars(word) for word in words + [item["w"] for item in items]):
+        sung_words, words = pair[0].split(), pair[1].split()
+        # Use the Suno spelling for timing boundaries; its pronunciation can
+        # have different letters from the word displayed on screen.
+        if (len(sung_words) == len(words) and
+                _chars(join_words([item["w"] for item in items])) == _chars(pair[0]) and
+                all(_chars(word) for word in sung_words + words + [item["w"] for item in items])):
             mapped, index = [], 0
-            for word in words:
+            for sung, word in zip(sung_words, words):
                 first, length = index, 0
-                while index < len(items) and length < len(_chars(word)):
+                while index < len(items) and length < len(_chars(sung)):
                     length += len(_chars(items[index]["w"]))
                     index += 1
-                if length != len(_chars(word)):
+                if length != len(_chars(sung)):
                     break
                 mapped.append({"w": word, "s": items[first]["s"], "e": items[index - 1]["e"],
                                "parenthetical": any(it.get("parenthetical") for it in items[first:index])})
@@ -4421,8 +4424,8 @@ def render_lyric_video(ff, mp3, bg_png, ass_path, out_mp4, height=1080, fps=30,
         # Blend luminance only. Screening neutral U/V planes would tint the
         # entire picture magenta instead of merely brightening the glints.
         chains.append(
-            "[still][spark]blend=c0_expr='min(255,A+B*0.70)':"
-            "c1_expr='A':c2_expr='A'[shimmer]"
+            "[still][spark]blend=c0_mode=addition:c0_opacity=0.70:"
+            "c1_mode=normal:c2_mode=normal[shimmer]"
         )
         last = "shimmer"
     interludes = ass_interlude_windows(ass_path) if interlude_mode else []
@@ -5382,6 +5385,7 @@ FIELD_ALIASES = {
     "to": "recipient", "reply": "recipient", "replyto": "recipient",
     "recipient": "recipient", "delivery": "delivery_mode",
     "slack channel id": "slack_channel_id",
+    "slack id": "slack_channel_id",
     "team": "tagline", "project": "tagline",
 }
 TRUEISH = {"yes", "y", "true", "1", "on", "instrumental"}
@@ -5581,7 +5585,15 @@ def validate_display_lyrics(lyrics, display_lyrics):
                 len(section["lines"]) != len(display_section["lines"])):
             raise ValueError("Display lyrics must have the same sections and lines as lyrics.")
         for line, display_line in zip(section["lines"], display_section["lines"]):
-            if _chars(line["text"]) != _chars(display_line["text"]):
+            sung_words = line["text"].split()
+            shown_words = display_line["text"].split()
+            if len(sung_words) != len(shown_words) or any(
+                    _chars(sung) != _chars(shown) and
+                    (_chars(sung), _chars(shown)) not in {
+                        ("jayson", "json"), ("randb", "rb"),
+                        ("genesis", "gnsys"), ("jot", "jwt"),
+                        ("pants", "pance"), ("toeful", "toefl")}
+                    for sung, shown in zip(sung_words, shown_words)):
                 raise ValueError(f"Display line must keep the same sung letters: {display_line['text']!r}")
 
 
@@ -6060,6 +6072,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "render_backend": CONFIG.get("render_backend", "local"),
                 "aws_ready": aws_ready(),
                 "aws_region": CONFIG.get("aws_region") or "",
+                "aws_render_size": CONFIG.get("aws_render_size", "large"),
                 "video_height": CONFIG.get("video_height"),
                 "video_dir": CONFIG.get("video_dir"),
                 "lyric_aligner": CONFIG.get("lyric_aligner", "section"),
@@ -6144,6 +6157,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if body["render_backend"] == "aws" and not aws_ready():
                     return self._json({"error": "Run AWS setup before choosing AWS rendering."}, 400)
                 CONFIG["render_backend"] = body["render_backend"]
+            if body.get("aws_render_size") in ("economy", "balanced", "large"):
+                CONFIG["aws_render_size"] = body["aws_render_size"]
             for k in ("provider", "output_dir", "video_dir", "staging_dir", "rejects_dir", "kie_key", "sunoapi_key", "atlascloud_key",
                       "openai_key", "openai_image_model", "todoist_token", "todoist_project",
                       "gmail_user", "gmail_app_password", "gmail_label", "slack_bot_token",
@@ -6848,6 +6863,9 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <label>Video rendering</label>
   <select id="s_backend"><option value="local">On this computer</option><option value="aws">AWS parallel jobs</option></select>
   <div class="hint" id="s_backend_state"></div>
+  <label>AWS render task size</label>
+  <select id="s_aws_size"><option value="economy">2 vCPU · 4 GB</option><option value="balanced">4 vCPU · 8 GB</option><option value="large">8 vCPU · 16 GB (fastest measured)</option></select>
+  <div class="hint">Applies to newly dispatched AWS videos. Changing this does not rebuild the cloud image. Larger tasks cost more per minute and use more regional quota.</div>
   <div class="row">
     <div><label style="margin-top:0">Resolution</label>
       <select id="s_vh"><option value="1080">1080p</option><option value="720">720p (faster)</option></select></div>
@@ -7397,6 +7415,7 @@ function openSettings(){
   $('s_test').textContent = '';
   $('s_vh').value = String(CFG.video_height||1080);
   $('s_backend').value = CFG.render_backend||'local';
+  $('s_aws_size').value = CFG.aws_render_size||'large';
   $('s_backend').querySelector('option[value="aws"]').disabled = !CFG.aws_ready;
   $('s_backend_state').textContent = CFG.aws_ready
     ? `AWS configured in ${CFG.aws_region}. Sign in with the saved AWS profile before rendering; cloud jobs are billed per task.`
@@ -7483,6 +7502,7 @@ async function saveSettings(){
                 suno_single_clip:$('s_oneclip').checked, image_prompt_fragments:readFragments(),
                 auto_generate:$('s_auto').checked, allowed_senders:$('s_as').value,
                 video_height:$('s_vh').value, render_backend:$('s_backend').value,
+                aws_render_size:$('s_aws_size').value,
                 visualizer:$('s_vis').value, video_dir:$('s_vd').value, alerts_enabled:$('s_al').checked,
                 lyric_aligner:$('s_align').value,
                 hybrid_repair:$('s_repair').value,

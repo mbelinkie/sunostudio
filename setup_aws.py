@@ -223,7 +223,10 @@ phases:
               "environment": environment, "serviceRole": role_arn,
               "timeoutInMinutes": 30,
               "logsConfig": {"cloudWatchLogs": {"status": "ENABLED",
-                                              "groupName": "/aws/codebuild/suno-studio"}}}
+                                              "groupName": "/aws/codebuild/suno-studio"},
+                             "s3Logs": {"status": "ENABLED",
+                                        "location": f"{bucket}/render-results/build-diagnostics",
+                                        "encryptionDisabled": True}}}
     existing = codebuild.batch_get_projects(names=[project])["projects"]
     if existing:
         codebuild.update_project(name=project, **config)
@@ -267,7 +270,7 @@ def _cluster_and_tasks(session, image, execution_role, render_role, delivery_rol
                     "awslogs-stream-prefix": family}}}])
         return definition["taskDefinition"]["taskDefinitionArn"]
 
-    render_task = task("suno-studio-render", 4096, 8192, render_role,
+    render_task = task("suno-studio-render", 8192, 16384, render_role,
                        {"SUNO_BUCKET": bucket})
     delivery_task = task("suno-studio-delivery", 1024, 2048, delivery_role,
                          {"SUNO_BUCKET": bucket,
@@ -368,8 +371,8 @@ def provision(args):
     quota = _quota(session)
     print(f"AWS account {account}; region {region}; default VPC {vpc}; subnets {', '.join(subnets)}")
     print(f"Fargate On-Demand vCPU quota: {quota if quota is not None else 'unavailable'}")
-    if quota is not None and quota < 100:
-        print("Request a quota increase to at least 100 vCPU for 25 parallel 4-vCPU renders.")
+    if quota is not None and quota < 200:
+        print("25 simultaneous default-size renders need 200 vCPU; smaller task sizes use less quota.")
     if args.check:
         return
     bucket = _bucket(session, account, region)
@@ -391,6 +394,9 @@ def provision(args):
     build_role = _role(iam, "suno-studio-build", "codebuild.amazonaws.com", [
         {"Effect": "Allow", "Action": ["s3:GetObject"],
          "Resource": f"{bucket_arn}/build-inputs/*"},
+        {"Effect": "Allow", "Action": "s3:GetBucketAcl", "Resource": bucket_arn},
+        {"Effect": "Allow", "Action": "s3:PutObject",
+         "Resource": f"{bucket_arn}/render-results/build-diagnostics/*"},
         {"Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*"},
         {"Effect": "Allow", "Action": ["logs:CreateLogGroup"], "Resource": "*"},
         {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],

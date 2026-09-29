@@ -108,6 +108,13 @@ class AWSRenderTests(unittest.TestCase):
         self.assertEqual(first["clientToken"], "attempt12345")
         self.assertLessEqual(len(first["clientToken"]), 64)
         self.assertEqual(first["startedBy"], "attempt12345")
+        self.assertEqual(first["overrides"]["cpu"], "8192")
+        self.assertEqual(first["overrides"]["memory"], "16384")
+        with patch.object(aws_render, "_client", return_value=ecs):
+            aws_render._run_task({**config, "render_size": "balanced"}, "render",
+                                 "attempt12345", "s3://private-bucket/manifest.json")
+        self.assertEqual(ecs.requests[-1]["overrides"]["cpu"], "4096")
+        self.assertEqual(ecs.requests[-1]["overrides"]["memory"], "8192")
 
     def test_reconcile_finds_stopped_task_after_dispatch_interruption(self):
         class ECS:

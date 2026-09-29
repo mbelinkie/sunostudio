@@ -153,14 +153,30 @@ Email links are signed locally and handled by the provisioned Lambda, so the
 local app does not call the Lambda API. If Slack was skipped during setup,
 rerun setup and enter the bot token before choosing AWS Slack delivery.
 
-The render task uses 4 vCPU and 8 GiB; delivery uses 1 vCPU and 2 GiB. Up to 25
-renders can run at once if your account has at least 100 Fargate On-Demand
-vCPUs available and other AWS quotas permit. As an example, using published
-Linux/x86 Fargate rates for us-east-1, five minutes at 4 vCPU and 8 GiB costs
-about $0.0165 in render-task compute:
+The default render task uses 8 vCPU and 16 GiB; delivery uses 1 vCPU and 2 GiB.
+In app Settings, **AWS render task size** can change future render jobs to
+2 vCPU/4 GiB, 4 vCPU/8 GiB, or 8 vCPU/16 GiB without rebuilding the worker
+image. One 178-second sample took 5:36 at 2 vCPU, 4:55 at 4 vCPU, and 1:56
+and 3:05 across two 8-vCPU runs, measured from dispatch through verified local
+download. Test your own video before relying on these times. Up to 25 default
+renders can run at once if your account has at least 200 Fargate On-Demand
+vCPUs available and other AWS quotas permit. With the 140-vCPU quota measured
+in the development account, no more than 17 default-size tasks fit at once.
+In a 25-job burst at 4 vCPU, 24 videos completed on the first attempt in
+5:48 total wall time; median individual completion was 5:21. One task failed
+while pulling the container image from ECR before encoding and needed an
+explicit retry, which succeeded in 4:47. All 25 videos were verified within
+about 10½ minutes including that sequential retry. Estimated render-task
+compute for all 25 initial attempts was
+about $0.36, or $0.014 per requested video before the retry. These timings
+start with prepared audio, artwork, and subtitles; song generation, artwork,
+review, and delivery are separate.
+As an example, using published
+Linux/x86 Fargate rates for us-east-1, two minutes at 8 vCPU and 16 GiB costs
+about $0.013 in render-task compute:
 
 ```text
-(4 × $0.04048 + 8 × $0.004445) × 5/60 hours ≈ $0.0165
+(8 × $0.04048 + 16 × $0.004445) × 2/60 hours ≈ $0.0132
 ```
 
 This is a compute estimate, not a per-song total. Check [AWS Fargate

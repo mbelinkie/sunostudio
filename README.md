@@ -59,10 +59,14 @@ resources in your AWS account and uses your AWS CLI SSO profile; Suno Studio
 does not store AWS access keys. AWS rendering is selected explicitly in
 Settings after setup, and local rendering remains the default.
 
-The render task uses 4 vCPU and 8 GiB, with up to 25 concurrent renders when
-your Fargate quota allows. At published Linux/x86 rates in us-east-1, five
-minutes of render-task compute is about $0.016; actual cost varies by region
-and runtime. S3 storage and requests, ECR image storage, CodeBuild, CloudWatch
+The fastest measured render task uses 8 vCPU and 16 GiB by default. Settings can choose
+2/4, 4/8, or 8/16 vCPU/GiB for future cloud renders without rebuilding the
+image. Up to 25 simultaneous default-size renders need at least 200 available
+Fargate vCPUs. For one 178-second sample, the 8-vCPU task finished in 1:56 and
+3:05 across two runs; use that range as a measurement, not a promise. At
+published Linux/x86 rates in us-east-1, those wall times imply roughly
+$0.013–$0.020 in render compute per video; actual billing and costs vary.
+S3 storage and requests, ECR image storage, CodeBuild, CloudWatch
 Logs, and network transfer can add charges. Song and artwork providers charge
 separately. See [SETUP.md](SETUP.md) for setup, retention, and cleanup details.
 

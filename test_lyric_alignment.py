@@ -542,6 +542,34 @@ class DisplayLyricsTests(unittest.TestCase):
         self.assertIn("GMAT", ass)
         self.assertNotIn("G-MAT", ass)
 
+    def test_changed_letter_pronunciations_keep_word_timing(self):
+        spoken = "[Verse]\nShip JAY-SON with R-AND-B today"
+        shown = "[Verse]\nShip JSON with R&B today"
+        app.validate_display_lyrics(spoken, shown)
+        words = timed_lines(["Ship JAY-SON with R-AND-B today"], {0: "[Verse]"},
+                            split={"JAY-SON": ["JAY", "SON"],
+                                   "R-AND-B": ["R", "AND", "B"]})
+        warnings = []
+        groups = app.karaoke_groups(words, spoken, display_lyrics=shown,
+                                    display_warnings=warnings)
+        items = groups[0][0]
+        self.assertEqual([item["w"] for item in items],
+                         ["Ship", "JSON", "with", "R&B", "today"])
+        self.assertEqual((items[1]["s"], items[1]["e"]),
+                         (words[1]["startS"], words[2]["endS"]))
+        self.assertEqual((items[3]["s"], items[3]["e"]),
+                         (words[4]["startS"], words[6]["endS"]))
+        self.assertEqual(warnings, [])
+        with self.assertRaisesRegex(ValueError, "same sung letters"):
+            app.validate_display_lyrics(spoken, shown.replace("JSON", "JASON"))
+
+    def test_slack_id_is_metadata_only(self):
+        form = app.parse_request("Song", "===EMAIL===\na@example.com\n"
+                                 "===SLACK ID===\nC01234567\n===LYRICS===\nHello")
+        self.assertEqual(form["slack_channel_id"], "C01234567")
+        self.assertEqual(form["delivery_mode"], "none")
+        self.assertEqual(form["lyrics"], "Hello")
+
     def test_uncertain_line_uses_local_display_fallback(self):
         groups = [[[{"w": "Gee", "s": 1.0, "e": 1.3},
                     {"w": "Mat", "s": 1.4, "e": 1.8}]],

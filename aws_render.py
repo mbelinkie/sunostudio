@@ -107,6 +107,15 @@ def _get_json(config, uri):
 def _run_task(config, mode, attempt, manifest_uri):
     ecs = _client("ecs", config["region"], config.get("profile"))
     task_definition = config["render_task"] if mode == "render" else config["delivery_task"]
+    overrides = {"containerOverrides": [{"name": config["container"],
+        "command": ["python", "aws_worker.py", mode, "--manifest-uri", manifest_uri]}]}
+    if mode == "render":
+        sizes = {"economy": (2048, 4096), "balanced": (4096, 8192),
+                 "large": (8192, 16384)}
+        size = config.get("render_size") or "large"
+        if size not in sizes:
+            raise ValueError("invalid AWS render task size")
+        overrides["cpu"], overrides["memory"] = map(str, sizes[size])
     response = ecs.run_task(
         cluster=config["cluster"], taskDefinition=task_definition,
         launchType="FARGATE", platformVersion="LATEST", count=1,
@@ -114,8 +123,7 @@ def _run_task(config, mode, attempt, manifest_uri):
         networkConfiguration={"awsvpcConfiguration": {
             "subnets": config["subnets"], "securityGroups": [config["security_group"]],
             "assignPublicIp": "ENABLED"}},
-        overrides={"containerOverrides": [{"name": config["container"],
-            "command": ["python", "aws_worker.py", mode, "--manifest-uri", manifest_uri]}]},
+        overrides=overrides,
     )
     if response.get("failures") or not response.get("tasks"):
         raise RuntimeError(f"ECS did not start the {mode} task: {response.get('failures')}")

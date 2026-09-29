@@ -11,6 +11,15 @@ import setup_aws
 
 
 class AwsAppTests(unittest.TestCase):
+    def test_render_size_settings_reach_aws_dispatch_without_rebuild(self):
+        with mock.patch.dict(app.CONFIG, {"aws_render_size": "large"}), \
+                mock.patch.object(app, "save_config"):
+            result = test_app_reliability.post_json("/api/config", {"aws_render_size": "economy"})
+            self.assertTrue(result["ok"])
+            self.assertEqual(app.aws_settings()["render_size"], "economy")
+            test_app_reliability.post_json("/api/config", {"aws_render_size": "invalid"})
+            self.assertEqual(app.aws_settings()["render_size"], "economy")
+
     def test_aws_check_does_not_create_security_group(self):
         class EC2:
             def describe_vpcs(self, **_kwargs):

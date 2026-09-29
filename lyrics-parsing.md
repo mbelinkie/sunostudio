@@ -61,13 +61,19 @@ Take the GMAT and SAT today
 ```
 
 `LYRICS` is sent to Suno and used for word alignment. `DISPLAY LYRICS` is
-used only after timing is known. Keep the same section tags, nonempty lyric
-lines, and sung letters in the same order; change only spelling, separators,
-case, or punctuation. A mismatch is shown in the inbox and blocks generation
-before Suno is called. Without the second block, existing behavior applies.
-An acronym timed as several Suno words becomes one displayed karaoke word
-spanning those timings. If a line cannot be mapped safely, the full display
-line receives one highlight and the subtitle doctor reports it.
+used only after timing is known. Keep the same section tags and nonempty lyric
+lines in the same order. Each display word must keep the sung letters in order
+or use one of the app's changed-letter pronunciation pairs from
+`acronym_pronunciations` (such as `JAY-SON`/`JSON` or `R-AND-B`/`R&B`). If that
+sheet gains a new changed-letter pair, add it to `validate_display_lyrics`.
+A mismatch is shown in the inbox
+and blocks generation before Suno is called. Without the second block, existing
+behavior applies. An acronym timed as several Suno words becomes one displayed
+karaoke word spanning those timings. If a line cannot be mapped safely, the
+full display line receives one highlight and the subtitle doctor reports it.
+
+`===SLACK ID===` is accepted as channel metadata after `===EMAIL===`; it does
+not select Slack delivery. Delivery still requires the explicit delivery mode.
 
 ---
 
