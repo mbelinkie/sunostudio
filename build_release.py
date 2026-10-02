@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "6.0"
+VERSION = "6.0.1"
 SOURCE_FILES = (
     "README.md", "SETUP.md", "SECURITY.md", "LICENSE", "lyrics-parsing.md",
     "suno_studio.py", "bug_reports.py", "stable_ts_hybrid.py", "subs_doctor.py",

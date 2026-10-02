@@ -12,19 +12,21 @@ rendering can encode several videos at once.
 ## Download and start
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0-macOS.zip` for the Mac app, or
-   `SunoStudio-6.0-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.1-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0.1-source.zip` for the source and Windows launcher.
 2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
    [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
    `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
    [setup guide](SETUP.md) has checks for macOS and Windows.
-3. Extract the ZIP. On macOS, move **Suno Studio 6.0.app** to Applications
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.1.app** to Applications
    and double-click it. On Windows, extract the full source ZIP folder
    and double-click **Start Suno Studio.bat** inside it. Keep the launcher
    beside `suno_studio.py`.
 4. Open <http://127.0.0.1:8765> if your browser does not open automatically.
-   In Settings, choose a song provider and paste its API key. Use **Create a
-   Song** with delivery set to **None** for a first run.
+   Choose **Getting started** for an in-app checklist, service explanations,
+   and per-video cost examples. In Settings, choose a song provider and paste
+   its API key. Use **Create a Song** with delivery set to **None** for a first
+   run.
 
 The macOS app archive is not signed or notarized. If Gatekeeper blocks it,
 control-click the app, choose **Open**, and confirm the prompt. Both packages

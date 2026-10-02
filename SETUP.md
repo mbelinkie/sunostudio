@@ -1,9 +1,45 @@
 # First run and optional services
 
+## Choose the simple path first
+
+For a first lyric video, you need **Python**, **FFmpeg**, and **one song-provider
+API key**. Leave Delivery at **None**, keep video rendering **On this computer**,
+and use the default gradient artwork. You can add Gmail, Slack, OpenAI, or AWS
+later without reinstalling Suno Studio. The app's **Getting started** button
+shows your current provider-key and FFmpeg status.
+
+| What you want | Add this | What it does |
+| --- | --- | --- |
+| A song and lyric video on your computer | Song provider, Python, FFmpeg | The provider makes the song; FFmpeg makes the MP4. |
+| AI artwork | OpenAI | Replaces the gradient; the focus-band effect may request a second image. |
+| Requests by email | Gmail | Reads a label and puts requests in the review inbox. |
+| Send to Slack | Slack bot | Uploads the approved MP4 to the channel you choose. |
+| Send by email | Gmail and AWS | Emails a private download link, valid for three days. |
+| Several videos at once | AWS | Runs a paid Fargate render task for each video. |
+
+### Cost guide for one roughly three-minute video
+
+| Service | When you pay | Planning estimate |
+| --- | --- | --- |
+| Python, FFmpeg, local rendering, gradient artwork | Never to Suno Studio | Free software; your own computer does the work. |
+| Song provider | Each generation request or provider subscription | **Variable.** Check the selected provider's dashboard for the model and plan you use. This is the only required third-party charge. |
+| OpenAI images | Only when AI artwork is selected | Budget **cents to tens of cents per image**; the focus-band edit can add a second image request. Check [current OpenAI API pricing](https://developers.openai.com/api/docs/pricing). |
+| AWS Fargate rendering | Each cloud task, including paid retries | About **$0.01–$0.03 render compute** for the measured three-minute sample in us-east-1. Other lengths and regions vary. |
+| AWS storage, build, logs, links, transfer | When cloud resources are created or used | Extra charges vary by usage; stored ECR images and logs can cost money even between renders. Check [AWS pricing](https://aws.amazon.com/fargate/pricing/). |
+| Gmail, Slack, Todoist | If you enable them | Suno Studio adds no fee; your account's plan or limits may apply. |
+| Sentry bug reports | Only if you submit a report | No account or charge is needed from the person running the app. The maintainer owns the Sentry project. |
+
+**Example, not a price quote:** if your song provider charges $0.25 per request,
+an image costs $0.08, and a cloud render costs $0.02, plan on about **$0.27**
+with gradient art or **$0.43** with two image requests, plus small AWS extras.
+Change those inputs to match your accounts. Local rendering removes the AWS
+render charge. A video retry on AWS starts another paid render; a delivery
+retry does not regenerate the song or video.
+
 ## Release downloads
 
-Download `SunoStudio-6.0-macOS.zip` or
-`SunoStudio-6.0-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.1-macOS.zip` or
+`SunoStudio-6.0.1-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -16,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0-macOS.zip` for the Mac app or
-   `SunoStudio-6.0-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.1-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.1-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -26,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.1.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.
@@ -38,7 +74,11 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 4. In Settings, choose a supported song provider and enter its API key. This
    is the only third-party key needed to generate songs. The title, style, and
    lyrics are sent to that provider to make the song. Provider accounts may
-   charge for generation.
+   charge for generation. [kie.ai](https://kie.ai/) is the default and sells
+   credits; [sunoapi.org](https://sunoapi.org/) also supports exact lyrics.
+   [Atlas Cloud](https://www.atlascloud.ai/) accepts lyric prompts but may
+   paraphrase them. Choose based on the provider's current price and whether
+   exact lyrics matter to you.
 5. Use the manual form to enter a title, style, and lyrics. Delivery defaults
    to **None**, so the song and video can be created without Gmail, Slack, or
    AWS configuration.
@@ -64,15 +104,16 @@ PowerShell window before running the check. The Windows launcher and checker
 are provided as setup guidance; Windows rendering has not been validated on a
 clean Windows installation.
 
-## Optional services
+## Optional service setup
 
-| Service | Needed for | Setup |
-| --- | --- | --- |
-| Song provider | Song generation | Enter the provider API key in local Settings. |
-| OpenAI | AI-generated artwork | Enter an OpenAI API key in Settings and choose AI artwork. Local artwork remains available without it. |
-| Gmail | Reading request emails or email delivery | Configure a Gmail address and Google app password in Settings. Use an app password, not your regular password. Email intake is optional; private-link email delivery also needs AWS setup. |
-| Slack | Slack delivery | Choose Slack and provide a channel ID such as `C0123456789`. AWS setup can store the Slack token in Secrets Manager for the delivery task. |
-| AWS | Parallel cloud video rendering, Slack delivery, and private email links | Configure an AWS CLI SSO profile, then run `setup_aws.py`. This is optional; local rendering stays the default. |
+Add only the service for the feature you want. In Settings, paste an OpenAI
+API key and choose **AI artwork** for AI images. For Gmail intake or email
+delivery, enter your Gmail address and a [Google app
+password](https://myaccount.google.com/apppasswords), not your regular
+password. Email delivery also needs AWS for its private link. For local Slack
+delivery, enter a Slack bot token, choose Slack for a request, and provide a
+channel ID such as `C0123456789`. For cloud Slack delivery, store the bot token
+during AWS setup. AWS setup details are below.
 
 Email intake accepts the following fields in either supported request layout:
 
@@ -101,7 +142,7 @@ SSO setup prompts for your organization's start URL, SSO region, account, and
 role:
 
 If you downloaded the macOS app ZIP, also download and extract
-`SunoStudio-6.0-source.zip` from the same GitHub release for the AWS
+`SunoStudio-6.0.1-source.zip` from the same GitHub release for the AWS
 setup scripts. On macOS, run the commands from Terminal in that extracted
 folder. After creating its `.venv` and completing AWS setup, launch the app
 with that folder's `Start Suno Studio.command`; it uses the virtual environment

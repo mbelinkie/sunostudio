@@ -47,7 +47,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0"
+APP_VERSION = "6.0.1"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -6681,6 +6681,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <h1>Suno Studio <span id="ver" class="vtag"></span></h1>
   <div class="spacer"></div>
   <button class="ghost small" onclick="reveal('')">Open delivery folder</button>
+  <button class="ghost small" onclick="openGuide()">Getting started</button>
   <button class="ghost small" onclick="openSettings()">Settings</button>
   <button class="ghost small" onclick="openBugReport()">Report a bug</button>
   <button class="ghost small" onclick="quitApp()">Quit</button>
@@ -6689,6 +6690,14 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <div class="wrap">
   <div>
     <div id="warn"></div>
+    <div class="card" id="setupcard" style="display:none;margin-bottom:20px">
+      <h2 style="font-size:18px;margin:0 0 3px">Make your first lyric video</h2>
+      <div class="hint" id="setupstatus"></div>
+      <div class="btns" style="margin-top:12px">
+        <button class="small" onclick="openGuide()">Show setup steps and costs</button>
+        <button class="ghost small" onclick="openSettings()">Open Settings</button>
+      </div>
+    </div>
     <div class="banner" id="alertbar" style="display:none"></div>
     <div class="watchbar" id="watchbar" style="display:none"></div>
 
@@ -6747,6 +6756,32 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     </div>
   </div>
 </div>
+
+<dialog id="guidedlg" style="max-width:720px;max-height:85vh;overflow:auto">
+  <h2 style="margin:0 0 4px">Getting started</h2>
+  <p style="margin:0">Start with a song provider and local video tools. Add the other services only when you want their features.</p>
+  <ol>
+    <li><b>Install Python 3.9+ and FFmpeg.</b> Both are free. FFmpeg needs subtitles and drawtext support. <span id="guide_video_status"></span></li>
+    <li><b>Choose a song provider in Settings and add its API key.</b> This is the only paid service needed for a song. <a href="https://kie.ai/" target="_blank" rel="noreferrer">kie.ai</a> (the default) and <a href="https://sunoapi.org/" target="_blank" rel="noreferrer">sunoapi.org</a> support your exact lyrics; <a href="https://www.atlascloud.ai/" target="_blank" rel="noreferrer">Atlas Cloud</a> may paraphrase them. Your title, style, and lyrics go to the chosen provider. <span id="guide_song_status"></span></li>
+    <li><b>Use Create a Song.</b> Enter a title, style, and lyrics; leave Delivery at None. Review the result and keep the MP4 on this computer.</li>
+  </ol>
+  <h3>Optional services</h3>
+  <ul>
+    <li><b>OpenAI:</b> creates AI artwork instead of the free gradient. The lyric focus band may make a second image request. Hosted lyric repair also uses OpenAI when selected.</li>
+    <li><b>Gmail:</b> reads requests from a chosen label or sends an approved video's link. Email links need AWS. A Google app password is needed; ordinary Gmail use has no app fee.</li>
+    <li><b>Slack:</b> sends an approved MP4 to a channel. Local sending needs a bot token; cloud sending uses a token stored during AWS setup. Your Slack plan may have limits.</li>
+    <li><b>AWS:</b> runs parallel video encodes and hosts private three-day email links. It is pay per use, but stored images and logs can have small ongoing charges. Local rendering is free.</li>
+    <li><b>Todoist:</b> optional low-credit alerts. <b>Sentry:</b> optional bug reports to the maintainer; you need no account for either to make a video.</li>
+  </ul>
+  <h3>What might one video cost?</h3>
+  <p>With local rendering and gradient artwork, you pay only your song provider. Its per-request price depends on your provider, model, and plan. Check its dashboard before generating.</p>
+  <p>Optional AI artwork adds the provider's price for one image, or two if the focus-band edit runs. As a planning allowance, budget <b>cents to tens of cents per image</b> and check <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noreferrer">current OpenAI pricing</a>.</p>
+  <p>Optional AWS rendering adds about <b>$0.01–$0.03 in render compute</b> for a three-minute sample, based on measured tasks in us-east-1. Storage, logs, transfers, setup builds, and delivery add to that. A failed task or video retry can be charged again. <a href="https://aws.amazon.com/fargate/pricing/" target="_blank" rel="noreferrer">Check regional AWS rates</a>.</p>
+  <p class="hint">Example only: if a song request costs $0.25, each image costs $0.08, and an AWS render costs $0.02, the total is about $0.27 with gradient art or $0.43 with two image requests, before small AWS extras. These are example inputs, not quoted provider prices.</p>
+  <p class="hint">For AWS setup commands, permissions, and cleanup, see <a href="https://github.com/mbelinkie/sunostudio/blob/main/SETUP.md" target="_blank" rel="noreferrer">the full setup guide</a>.</p>
+  <div class="actions"><button onclick="guidedlg.close();openSettings()">Open Settings</button>
+    <button class="ghost" onclick="guidedlg.close()">Close</button></div>
+</dialog>
 
 <dialog id="bugdlg">
   <h3 style="margin:0 0 4px">Report a bug</h3>
@@ -6948,12 +6983,17 @@ async function loadConfig(){
   $('ver').textContent = 'v' + (CFG.version || '?');
   document.title = 'Suno Studio v' + (CFG.version || '?');
   const notices=[];
-  if(!CFG.has_key) notices.push('Add a song-provider API key in Settings to make your first song.');
-  else if(!CFG.exact_lyrics) notices.push(p.label+" may paraphrase submitted lyrics. Choose a provider with exact-lyrics support if needed.");
-  if(!CFG.ffmpeg || (CFG.ffmpeg_missing||[]).length)
-    notices.push('Install FFmpeg with subtitles and drawtext support to make videos. See SETUP.md in your downloaded folder.');
+  if(CFG.has_key && !CFG.exact_lyrics) notices.push(p.label+" may paraphrase submitted lyrics. Choose a provider with exact-lyrics support if needed.");
   $('warn').innerHTML = notices.map(message=>`<div class="banner">${esc(message)}</div>`).join('');
+  const needsVideo = !CFG.ffmpeg || (CFG.ffmpeg_missing||[]).length;
+  $('setupcard').style.display = (!CFG.has_key || needsVideo) ? 'block' : 'none';
+  $('setupstatus').textContent = !CFG.has_key && needsVideo ? 'Add a song-provider key and install compatible FFmpeg to begin.'
+    : !CFG.has_key ? 'Add a song-provider key to begin.' : 'Install compatible FFmpeg to make videos.';
+  $('guide_song_status').textContent = CFG.has_key ? 'Ready.' : 'Key needed.';
+  $('guide_video_status').textContent = needsVideo ? 'FFmpeg needs attention.' : 'FFmpeg ready.';
 }
+
+function openGuide(){ $('guidedlg').showModal(); }
 
 async function generate(){
   const deliveryMode = $('manual_delivery_mode').value || 'none';
