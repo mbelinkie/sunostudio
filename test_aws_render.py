@@ -1,8 +1,11 @@
 import hashlib
+import io
 import json
+import os
 import tempfile
 import unittest
 import urllib.parse
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +20,28 @@ CONFIG = {"region": "us-east-1", "bucket": "private-bucket", "cluster": "cluster
 
 
 class AWSRenderTests(unittest.TestCase):
+    def test_cloud_zips_accept_release_file_timestamps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("Dockerfile.aws", "requirements-cloud.txt",
+                         "aws_worker.py", "suno_studio.py", "aws_link.py"):
+                path = root / name
+                path.write_text("test")
+                os.utime(path, (0, 0))
+            client = unittest.mock.MagicMock()
+            client.get_function_url_config.return_value = {
+                "FunctionUrl": "https://link.example/", "AuthType": "NONE"}
+            session = unittest.mock.MagicMock()
+            session.client.return_value = client
+            with patch.object(setup_aws, "ROOT", root):
+                content = setup_aws._source_zip()
+                setup_aws._link_function(session, "role", "bucket", "secret", "us-east-1")
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                self.assertEqual(len(archive.namelist()), 4)
+            link_content = client.update_function_code.call_args.kwargs["ZipFile"]
+            with zipfile.ZipFile(io.BytesIO(link_content)) as archive:
+                self.assertEqual(archive.namelist(), ["aws_link.py"])
+
     def test_worker_requests_slack_upload_slot_as_form_data(self):
         response = unittest.mock.MagicMock()
         response.__enter__.return_value = response

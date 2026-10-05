@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "6.0.3"
+VERSION = "6.0.4"
 SOURCE_FILES = (
     "README.md", "SETUP.md", "SECURITY.md", "LICENSE", "lyrics-parsing.md",
     "suno_studio.py", "bug_reports.py", "stable_ts_hybrid.py", "subs_doctor.py",
@@ -90,7 +90,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", args.version):
-        parser.error("version must look like 6.0 or 6.0.3")
+        parser.error("version must look like 6.0 or 6.0.4")
     source_files = _files(args.version)
     source_version = re.search(
         r'^APP_VERSION\s*=\s*["\']([^"\']+)',

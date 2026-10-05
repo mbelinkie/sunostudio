@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.3"
+APP_VERSION = "6.0.4"
 
 PORT = 8765
 HOST = "127.0.0.1"

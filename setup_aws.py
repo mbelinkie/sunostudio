@@ -177,7 +177,8 @@ def _source_zip():
     files = ("Dockerfile.aws", "requirements-cloud.txt", "aws_worker.py",
              "suno_studio.py")
     memory = io.BytesIO()
-    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED,
+                         strict_timestamps=False) as archive:
         for name in files:
             archive.write(ROOT / name, name)
     return memory.getvalue()
@@ -283,7 +284,8 @@ def _link_function(session, role_arn, bucket, secret, region):
     client = session.client("lambda")
     name = "suno-studio-private-link"
     memory = io.BytesIO()
-    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(memory, "w", zipfile.ZIP_DEFLATED,
+                         strict_timestamps=False) as archive:
         archive.write(ROOT / "aws_link.py", "aws_link.py")
     code = memory.getvalue()
     env = {"Variables": {"SUNO_BUCKET": bucket, "LINK_SECRET": secret}}
