@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.5"
+APP_VERSION = "6.0.6"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -242,10 +242,28 @@ def atomic_write_text(path, value, mode=None):
 
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    refresh_aws_resources(cfg)
     atomic_write_json(CONFIG_PATH, cfg, mode=0o600)
     try:
         os.chmod(CONFIG_PATH, 0o600)
     except Exception:
+        pass
+
+
+AWS_RESOURCE_KEYS = (
+    "aws_region", "aws_bucket", "aws_cluster", "aws_render_task",
+    "aws_delivery_task", "aws_subnets", "aws_security_group", "aws_link_url",
+    "aws_link_secret", "aws_account_id", "aws_profile",
+)
+
+
+def refresh_aws_resources(cfg):
+    """Use task IDs written by AWS setup, even if this app was already running."""
+    try:
+        saved = json.loads(CONFIG_PATH.read_text())
+        if isinstance(saved, dict):
+            cfg.update({key: saved[key] for key in AWS_RESOURCE_KEYS if key in saved})
+    except (OSError, ValueError):
         pass
 
 
@@ -893,6 +911,7 @@ class SlackDeliveryError(RuntimeError):
 
 def aws_settings():
     """Read resource IDs saved by setup_aws.py; importing AWS stays optional."""
+    refresh_aws_resources(CONFIG)
     return {
         "profile": CONFIG.get("aws_profile"),
         "region": CONFIG.get("aws_region"), "bucket": CONFIG.get("aws_bucket"),
@@ -1052,6 +1071,26 @@ def aws_ready():
         return True
     except (ImportError, ValueError):
         return False
+
+
+def aws_signin_status():
+    """Check the selected backend without exposing AWS identity to the browser."""
+    if CONFIG.get("render_backend") != "aws":
+        return "local"
+    if not aws_ready():
+        return "setup"
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        settings = aws_settings()
+        session = boto3.Session(profile_name=settings.get("profile") or None,
+                                region_name=settings["region"])
+        sts = session.client("sts", config=BotoConfig(
+            connect_timeout=2, read_timeout=2, retries={"max_attempts": 1}))
+        account = sts.get_caller_identity().get("Account")
+        return "ready" if account == CONFIG.get("aws_account_id") else "wrong_account"
+    except Exception:
+        return "signin"
 
 
 def email_link_for_job(job):
@@ -4770,9 +4809,7 @@ def complete_video_job(job_id, out, folder, pipeline):
     out = Path(out)
     size = out.stat().st_size / 1e6
     if pipeline:
-        fields = job_snapshot(job_id).get("current_fields") or JOB_FORMS.get(job_id) or {}
-        delivery_mode = delivery_details(fields)[0]
-        paused = bool(CONFIG.get("gate_video")) or delivery_mode != "none"
+        paused = bool(CONFIG.get("gate_video"))
         set_job(job_id, status=("paused_video" if paused else "running"), stage="video",
                 phase="done", progress=100, encoder_pid=None, video_path=str(out),
                 message=("video ready for approval" if paused else "publishing video"),
@@ -6181,6 +6218,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/aws/setup":
             return self._json(aws_setup_snapshot())
 
+        if u.path == "/api/aws/status":
+            return self._json({"state": aws_signin_status()})
+
         if u.path == "/api/subtitles":
             job_id = (q.get("job") or [""])[0]
             job = job_snapshot(job_id)
@@ -6539,6 +6579,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "title": (body.get("title") or "").strip(),
                 "style": (body.get("style") or "").strip(),
                 "lyrics": body.get("lyrics") or "",
+                "caption": body.get("caption") or "",
                 "model": body.get("model") or "",
                 "instrumental": bool(body.get("instrumental")),
                 "negativeTags": (body.get("negativeTags") or "").strip(),
@@ -6852,11 +6893,15 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 .vtag{font-size:11px;font-weight:600;color:var(--dim);background:var(--panel2);
   border:1px solid var(--line);border-radius:20px;padding:2px 8px;margin-left:8px;
   vertical-align:2px;letter-spacing:.03em}
+.render-status{white-space:nowrap}
+.render-status[data-state="ready"]{color:var(--accent2);border-color:var(--accent2)}
+.render-status[data-state="signin"],.render-status[data-state="wrong_account"]{color:var(--warn);border-color:var(--warn)}
 </style></head><body>
 
 <header>
   <div class="logo"></div>
   <h1>Suno Studio <span id="ver" class="vtag"></span></h1>
+  <button id="render_status" class="ghost small render-status" data-state="checking" onclick="openRenderStatus()" title="Check rendering status">Rendering: checking…</button>
   <div class="spacer"></div>
   <button class="ghost small" onclick="reveal('')">Open delivery folder</button>
   <button class="ghost small" onclick="openGuide()">Getting started</button>
@@ -6888,6 +6933,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
       <input type="text" id="style" placeholder="indie folk, acoustic guitar, warm">
       <label for="lyrics">Lyrics</label>
       <textarea id="lyrics" placeholder="[Verse 1]\nYour lyrics here…"></textarea>
+      <label for="manual_caption">Song Caption (optional)</label>
+      <input type="text" id="manual_caption" maxlength="239" placeholder="Message to accompany the finished video">
       <div class="row">
         <div>
           <label for="manual_delivery_mode">Delivery</label>
@@ -7182,14 +7229,39 @@ async function loadConfig(){
     : !CFG.has_key ? 'Add a song-provider key to begin.' : 'Install compatible FFmpeg to make videos.';
   $('guide_song_status').textContent = CFG.has_key ? 'Ready.' : 'Key needed.';
   $('guide_video_status').textContent = needsVideo ? 'FFmpeg needs attention.' : 'FFmpeg ready.';
+  refreshRenderStatus();
 }
 
 function openGuide(){ $('guidedlg').showModal(); }
+
+async function refreshRenderStatus(){
+  const badge=$('render_status');
+  if(!badge) return;
+  try{
+    const response=await fetch('/api/aws/status');
+    if(!response.ok) throw new Error('status unavailable');
+    const {state}=await response.json();
+    const labels={local:'Rendering: this computer',setup:'Cloud: setup needed',
+      ready:'Cloud: ready',signin:'Cloud: sign in needed',
+      wrong_account:'Cloud: wrong account'};
+    badge.dataset.state=state;
+    badge.textContent=labels[state]||'Cloud: check Settings';
+  }catch(_error){
+    badge.dataset.state='signin';
+    badge.textContent='Cloud: status unavailable';
+  }
+}
+
+function openRenderStatus(){
+  openSettings();
+  if($('render_status').dataset.state==='signin') awsStep('signin');
+}
 
 async function generate(){
   const deliveryMode = $('manual_delivery_mode').value || 'none';
   const body = {
     title: $('title').value, style: $('style').value, lyrics: $('lyrics').value,
+    caption: $('manual_caption').value,
     delivery_mode: deliveryMode,
     recipient: deliveryMode==='email' ? $('manual_recipient').value : '',
     slack_channel_id: deliveryMode==='slack' ? $('manual_slack_channel').value : '',
@@ -7304,6 +7376,7 @@ function sectionAttrs(job, section, initiallyOpen){
 
 function mediaBusy(el){
   return !!el.querySelector('[data-subtitle-editor][data-active="true"]') ||
+    !!el.querySelector('details[data-job-section$=":song_editor"][open]') ||
     [...el.querySelectorAll('audio,video')].some(m => !m.paused && !m.ended && m.currentTime > 0);
 }
 
@@ -7374,7 +7447,7 @@ function deliveryEditor(j){
   const id=j.id, f=j.current_fields||{}, mode=f.delivery_mode||'none';
   const invalid=!['none','email','slack'].includes(mode);
   const options=`${invalid?`<option value="${esc(mode)}" selected>Invalid choice: ${esc(mode)}</option>`:''}<option value="none" ${mode==='none'?'selected':''}>None</option><option value="slack" ${mode==='slack'?'selected':''}>Slack</option><option value="email" ${mode==='email'?'selected':''}>Email</option>`;
-  return `<div class="delivery-review"><label for="${fieldId(id,'caption')}">Song Caption</label><input type="text" id="${fieldId(id,'caption')}" value="${esc(f.caption||'')}" maxlength="239" placeholder="Optional message to accompany the video"><label>Delivery</label><select id="${fieldId(id,'delivery_mode')}" onchange="deliveryModeChanged('${id}')">${options}</select><div id="${fieldId(id,'email_target')}" ${mode==='email'?'':'hidden'}><label>Recipient</label><input type="text" id="${fieldId(id,'recipient')}" value="${esc(f.recipient||'')}" placeholder="name@example.com"></div><div id="${fieldId(id,'slack_target')}" ${mode==='slack'?'':'hidden'}><label>Slack Channel ID</label><input type="text" id="${fieldId(id,'slack_channel_id')}" value="${esc(f.slack_channel_id||'')}" placeholder="C0123456789"></div><div class="hint">A delivery problem keeps the approved local MP4 and can be corrected here without rendering again.</div></div>`;
+  return `<div class="delivery-review"><label for="${fieldId(id,'caption')}">Song Caption</label><input type="text" id="${fieldId(id,'caption')}" value="${esc(f.caption||'')}" maxlength="239" placeholder="Optional message to accompany the video"><label>Delivery</label><select id="${fieldId(id,'delivery_mode')}" onchange="deliveryModeChanged('${id}')">${options}</select><div id="${fieldId(id,'email_target')}" ${mode==='email'?'':'hidden'}><label>Recipient</label><input type="text" id="${fieldId(id,'recipient')}" value="${esc(f.recipient||'')}" placeholder="name@example.com"></div><div id="${fieldId(id,'slack_target')}" ${mode==='slack'?'':'hidden'}><label>Slack Channel ID</label><input type="text" id="${fieldId(id,'slack_channel_id')}" value="${esc(f.slack_channel_id||'')}" placeholder="C0123456789"></div></div>`;
 }
 async function retryDelivery(job, status, mode){
   const fields=deliveryFields(job);
@@ -7397,12 +7470,7 @@ function songPicker(j){
 }
 function songEditor(j){
   const f=j.current_fields||{}; const id=j.id;
-  return `<div class="btns" style="margin-top:10px"><button class="ghost small" onclick="toggleSongEditor('${id}',this)">Edit Song Details</button></div><div id="pe_${id}" style="display:none"><div class="row"><div><label>Title</label><input id="${fieldId(id,'title')}" value="${esc(f.title||'')}"></div><div><label>Tagline</label><input id="${fieldId(id,'tagline')}" value="${esc(f.tagline||'')}"></div></div><label>Genre / Style</label><input id="${fieldId(id,'style')}" value="${esc(f.style||'')}"><label>Lyrics</label><textarea id="${fieldId(id,'lyrics')}" style="min-height:120px">${esc(f.lyrics||'')}</textarea><label>Infographic</label><textarea id="${fieldId(id,'infographic')}" style="min-height:80px">${esc(f.infographic||'')}</textarea><div class="btns"><button class="ghost small" onclick="saveGateFields('${id}')">Save Song Details</button><button class="ghost small" onclick="pipelineAction('${id}','revert_email')">Revert To Email Original</button></div>${j.stale_song?'<div class="hint" style="color:var(--warn)">Lyrics or genre changed: generate a new song before continuing.</div>':''}</div>`;
-}
-function toggleSongEditor(id, btn){
-  const editor=$('pe_'+id), opening=editor.style.display==='none';
-  editor.style.display=opening?'block':'none';
-  btn.textContent=opening?'Hide Song Details':'Edit Song Details';
+  return `<details${sectionAttrs(id,'song_editor',false)} style="margin-top:10px"><summary>Edit Song Details</summary><div class="row"><div><label>Title</label><input id="${fieldId(id,'title')}" value="${esc(f.title||'')}"></div><div><label>Tagline</label><input id="${fieldId(id,'tagline')}" value="${esc(f.tagline||'')}"></div></div><label>Genre / Style</label><input id="${fieldId(id,'style')}" value="${esc(f.style||'')}"><label>Lyrics</label><textarea id="${fieldId(id,'lyrics')}" style="min-height:120px">${esc(f.lyrics||'')}</textarea><label>Infographic</label><textarea id="${fieldId(id,'infographic')}" style="min-height:80px">${esc(f.infographic||'')}</textarea><div class="btns"><button class="ghost small" onclick="saveGateFields('${id}')">Save Song Details</button><button class="ghost small" onclick="pipelineAction('${id}','revert_email')">Revert To Email Original</button></div>${j.stale_song?'<div class="hint" style="color:var(--warn)">Lyrics or genre changed: generate a new song before continuing.</div>':''}</details>`;
 }
 async function openSubtitleEditor(job){
   const editor=$('subtitle_editor_'+job), text=$('subtitle_text_'+job), state=$('subtitle_state_'+job);
@@ -7807,6 +7875,7 @@ async function saveSettings(){
 syncManualDeliveryFields();
 loadConfig().then(refresh);
 setInterval(refresh, 3000);
+setInterval(refreshRenderStatus, 60000);
 </script></body></html>
 """
 

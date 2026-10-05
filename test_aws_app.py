@@ -1,5 +1,8 @@
 """App-level checks for AWS dispatch recovery and explicit report sending."""
 
+import json
+import sys
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -11,6 +14,65 @@ import setup_aws
 
 
 class AwsAppTests(unittest.TestCase):
+    def test_header_render_status_checks_selected_account(self):
+        with mock.patch.dict(app.CONFIG, {"render_backend": "local"}):
+            self.assertEqual(app.aws_signin_status(), "local")
+
+        sts = mock.Mock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        session = mock.Mock()
+        session.client.return_value = sts
+        boto3 = types.ModuleType("boto3")
+        boto3.Session = mock.Mock(return_value=session)
+        botocore = types.ModuleType("botocore")
+        botocore.__path__ = []
+        botocore_config = types.ModuleType("botocore.config")
+        botocore_config.Config = mock.Mock()
+        with mock.patch.dict(app.CONFIG, {"render_backend": "aws",
+                                          "aws_account_id": "123456789012"}), \
+                mock.patch.object(app, "aws_ready", return_value=True), \
+                mock.patch.object(app, "aws_settings", return_value={
+                    "profile": "suno", "region": "us-east-1"}), \
+                mock.patch.dict(sys.modules, {"boto3": boto3, "botocore": botocore,
+                                              "botocore.config": botocore_config}):
+            self.assertEqual(app.aws_signin_status(), "ready")
+            self.assertEqual(boto3.Session.call_args.kwargs["profile_name"], "suno")
+            sts.get_caller_identity.return_value = {"Account": "999999999999"}
+            self.assertEqual(app.aws_signin_status(), "wrong_account")
+            sts.get_caller_identity.side_effect = RuntimeError("expired")
+            self.assertEqual(app.aws_signin_status(), "signin")
+
+    def test_external_aws_update_is_used_by_running_app(self):
+        with TemporaryDirectory() as td:
+            path = Path(td) / "config.json"
+            path.write_text(json.dumps({"aws_render_task": "render:new",
+                                        "aws_delivery_task": "delivery:new"}))
+            with mock.patch.object(app, "CONFIG_PATH", path), \
+                    mock.patch.object(app, "CONFIG", {
+                        "aws_render_task": "render:old", "aws_delivery_task": "delivery:old",
+                        "aws_render_size": "economy"}):
+                settings = app.aws_settings()
+            self.assertEqual(settings["render_task"], "render:new")
+            self.assertEqual(settings["delivery_task"], "delivery:new")
+            self.assertEqual(settings["render_size"], "economy")
+
+    def test_settings_save_preserves_externally_updated_aws_tasks(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "config.json"
+            path.write_text(json.dumps({"aws_render_task": "render:new",
+                                        "aws_delivery_task": "delivery:new"}))
+            settings = {"aws_render_task": "render:old", "aws_delivery_task": "delivery:old",
+                        "video_height": 720, "aws_render_size": "economy"}
+            with mock.patch.object(app, "CONFIG_DIR", root), \
+                    mock.patch.object(app, "CONFIG_PATH", path):
+                app.save_config(settings)
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved["aws_render_task"], "render:new")
+            self.assertEqual(saved["aws_delivery_task"], "delivery:new")
+            self.assertEqual(saved["video_height"], 720)
+            self.assertEqual(saved["aws_render_size"], "economy")
+
     def test_in_app_setup_requires_checked_identity_for_exact_profile_and_region(self):
         with mock.patch.dict(app.AWS_SETUP, {"status": "idle", "checked": None,
                                             "lines": []}), \

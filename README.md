@@ -12,13 +12,13 @@ rendering can encode several videos at once.
 ## Download and start
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.5-macOS.zip` for the Mac app, or
-   `SunoStudio-6.0.5-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.6-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0.6-source.zip` for the source and Windows launcher.
 2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
    [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
    `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
    [setup guide](SETUP.md) has checks for macOS and Windows.
-3. Extract the ZIP. On macOS, move **Suno Studio 6.0.5.app** to Applications
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.6.app** to Applications
    and double-click it. On Windows, extract the full source ZIP folder
    and double-click **Start Suno Studio.bat** inside it. Keep the launcher
    beside `suno_studio.py`.
@@ -37,11 +37,12 @@ The local app needs no Python packages or cloud account. Gmail, OpenAI, AWS,
 and Slack are optional. See [SETUP.md](SETUP.md) for optional services and
 troubleshooting.
 
-Version 6.0.5 adds an optional Song Caption from email intake. Review or edit
-it when approving the final video. It replaces the message above a Slack MP4
-or opens the delivery email, while the file keeps its descriptive name. An
-existing AWS installation should run **Create AWS resources** again in
-Settings to deploy the updated cloud delivery worker.
+Version 6.0.6 lets a request run through video delivery automatically when
+**Require approval after video rendering** is off. Song Caption is also
+available in manual creation. AWS task updates made while the app is open are
+used for new jobs instead of being replaced by older saved settings.
+The header shows whether rendering uses this computer or AWS, including when
+AWS sign-in needs renewing. Edit Song Details stays open while you edit.
 
 ## Creation and delivery
 
@@ -49,7 +50,8 @@ Settings to deploy the updated cloud delivery worker.
   song, artwork, and video before approval.
 - Keep the finished MP4 locally, send it to a Slack channel, or email a private
   download link that expires after three days. Delivery happens only after
-  video approval. Fix delivery details and retry a failed send without
+  video completion, or after approval when that gate is enabled. Fix delivery
+  details and retry a failed send without
   regenerating the song or video.
 - Gmail intake is optional and review-first. Email requests can include
   `Delivery: Slack`, `Delivery: Email`, or `Delivery: None`, plus `Slack

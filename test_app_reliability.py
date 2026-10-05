@@ -178,6 +178,45 @@ class ReliabilityTests(unittest.TestCase):
         finally:
             app.JOBS, app.JOB_FORMS, app.JOBS_PATH = old_jobs, old_forms, old_path
 
+    def test_video_finishes_and_queues_slack_when_approval_is_off(self):
+        old_jobs, old_forms = app.JOBS, app.JOB_FORMS
+        old_config = dict(app.CONFIG)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                staging = Path(td) / "staging"
+                staging.mkdir()
+                video = staging / "video.mp4"
+                video.write_bytes(b"finished video")
+                final = Path(td) / "Final" / "video.mp4"
+                final.parent.mkdir()
+                app.CONFIG["gate_video"] = False
+                app.JOBS = {"job": {"id": "job", "pipeline": True,
+                    "status": "running", "stage": "video", "staging_folder": str(staging),
+                    "current_fields": {"title": "Song", "caption": "A jazz launch!",
+                                       "delivery_mode": "slack", "slack_channel_id": "C123ABC"}}}
+                app.JOB_FORMS = {}
+
+                def publish(_source, _job_id, _recipient):
+                    final.write_bytes(video.read_bytes())
+                    return str(final)
+
+                with mock.patch.object(app, "_save_jobs_locked"), \
+                        mock.patch.object(app, "move_to_final", side_effect=publish), \
+                        mock.patch.object(app.threading, "Thread") as sender:
+                    app.complete_video_job("job", video, staging, pipeline=True)
+                self.assertEqual(app.JOBS["job"]["status"], "completed")
+                self.assertEqual(app.JOBS["job"]["delivery_status"], "queued")
+                self.assertEqual(app.JOBS["job"]["current_fields"]["caption"],
+                                 "A jazz launch!")
+                self.assertEqual(sender.call_args.kwargs["target"], app.send_job_delivery)
+                self.assertTrue(final.is_file())
+        finally:
+            app.JOBS, app.JOB_FORMS = old_jobs, old_forms
+            app.CONFIG.clear(); app.CONFIG.update(old_config)
+
+    def test_delivery_editor_does_not_claim_a_problem_before_send(self):
+        self.assertNotIn("A delivery problem keeps the approved local MP4", app.PAGE)
+
     def test_caption_is_escaped_in_approval_editor_and_limited(self):
         self.assertIn("value=\"${esc(f.caption||'')}\"", app.PAGE)
         self.assertIn("fields.caption=$(fieldId(job,'caption'))?.value||'';", app.PAGE)
@@ -201,10 +240,12 @@ class ReliabilityTests(unittest.TestCase):
             with mock.patch.object(app, "_save_jobs_locked"), \
                     mock.patch.object(app.threading, "Thread"):
                 result = post_json("/api/generate", {
-                    "title": "Manual", "style": "synth pop", "lyrics": "A chorus"})
+                    "title": "Manual", "style": "synth pop", "lyrics": "A chorus",
+                    "caption": "A chorus for the team."})
             self.assertTrue(result["ok"])
             job = app.JOBS[result["id"]]
             self.assertEqual(job["current_fields"]["delivery_mode"], "none")
+            self.assertEqual(job["current_fields"]["caption"], "A chorus for the team.")
             self.assertEqual(job["delivery_status"], "not_requested")
             self.assertIn('id="manualcard"', app.PAGE)
             self.assertIn('id="manual_delivery_mode"', app.PAGE)
@@ -520,10 +561,12 @@ class ReliabilityTests(unittest.TestCase):
         for call in (
                 "sectionAttrs(j.id,'job',true)",
                 "sectionAttrs(id,'song',true)",
+                "sectionAttrs(id,'song_editor',false)",
                 "sectionAttrs(j.id,'image',true)",
                 "sectionAttrs(id,'video',true)",
                 "sectionAttrs(id,'subtitles',false)"):
             self.assertIn(call, page)
+        self.assertIn("details[data-job-section$=\":song_editor\"][open]", page)
 
     def test_sender_allowlist_uses_exact_mailbox_or_domain(self):
         old = app.CONFIG.get("allowed_senders")
