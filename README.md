@@ -12,13 +12,13 @@ rendering can encode several videos at once.
 ## Download and start
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.1-macOS.zip` for the Mac app, or
-   `SunoStudio-6.0.1-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.2-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0.2-source.zip` for the source and Windows launcher.
 2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
    [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
    `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
    [setup guide](SETUP.md) has checks for macOS and Windows.
-3. Extract the ZIP. On macOS, move **Suno Studio 6.0.1.app** to Applications
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.2.app** to Applications
    and double-click it. On Windows, extract the full source ZIP folder
    and double-click **Start Suno Studio.bat** inside it. Keep the launcher
    beside `suno_studio.py`.
@@ -59,7 +59,10 @@ troubleshooting.
 Local rendering works without an AWS account. If you opt in, setup creates
 resources in your AWS account and uses your AWS CLI SSO profile; Suno Studio
 does not store AWS access keys. AWS rendering is selected explicitly in
-Settings after setup, and local rendering remains the default.
+Settings after setup, and local rendering remains the default. Open **Settings
+→ Lyric video → AWS setup and task size** to sign in, check the account, and
+create the resources. The app installs its AWS support privately on first use;
+no terminal setup command is needed once an AWS CLI profile exists.
 
 The fastest measured render task uses 8 vCPU and 16 GiB by default. Settings can choose
 2/4, 4/8, or 8/16 vCPU/GiB for future cloud renders without rebuilding the

@@ -38,8 +38,8 @@ retry does not regenerate the song or video.
 
 ## Release downloads
 
-Download `SunoStudio-6.0.1-macOS.zip` or
-`SunoStudio-6.0.1-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.2-macOS.zip` or
+`SunoStudio-6.0.2-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -52,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.1-macOS.zip` for the Mac app or
-   `SunoStudio-6.0.1-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.2-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.2-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -62,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.1.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.2.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.
@@ -135,25 +135,35 @@ delivery without making the video again.
 
 ## AWS Fargate setup, cost, retention, and cleanup
 
-Cloud rendering is optional and billed to your AWS account. Install AWS CLI
-v2, use an AWS IAM Identity Center (SSO) profile with permission to provision
-the resources below, and run these commands from the repository folder. The
-SSO setup prompts for your organization's start URL, SSO region, account, and
-role:
+Cloud rendering is optional and billed to your AWS account. Install [AWS CLI
+v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+and create an [AWS IAM Identity Center (SSO)
+profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)
+with permission to provision the resources below. AWS account administrators
+may need to grant these permissions. Then open **Settings → Lyric video → AWS
+setup and task size**:
 
-If you downloaded the macOS app ZIP, also download and extract
-`SunoStudio-6.0.1-source.zip` from the same GitHub release for the AWS
-setup scripts. On macOS, run the commands from Terminal in that extracted
-folder. After creating its `.venv` and completing AWS setup, launch the app
-with that folder's `Start Suno Studio.command`; it uses the virtual environment
-with AWS support installed. Quit the standalone `.app` first; otherwise the
-source launcher opens its already-running window. The standalone `.app` does
-not use this `.venv`.
+1. Select the AWS profile and region, then click **Sign in**. Follow the
+   browser prompt or device-code instructions shown in the app.
+2. Click **Check account**. Read the account ID, region, default VPC, and
+   Fargate quota before proceeding. This step does not create AWS resources.
+3. Click **Create AWS resources**. Suno Studio installs its AWS library in a
+   private folder and creates the cloud worker and resources in that checked
+   account. This can take several minutes and can incur setup charges.
+4. Select **AWS parallel jobs** under Video rendering and click **Save**.
+   Local rendering stays selected until you choose AWS.
+
+If you want cloud Slack delivery, first save a Slack bot token under **Slack
+delivery** in Settings. Setup copies it to AWS Secrets Manager. You can also
+rerun setup later after adding a token. The app does not store AWS access
+keys. The private AWS library lives under `~/.suno_studio/` (or
+`%USERPROFILE%\.suno_studio\` on Windows), so the standalone macOS app can
+use it after a restart.
+
+For troubleshooting, the command-line setup remains available from the source
+download:
 
 ```bash
-aws configure sso --profile suno-studio
-aws sso login --profile suno-studio
-aws sts get-caller-identity --profile suno-studio
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-cloud.txt
 .venv/bin/python setup_aws.py --profile suno-studio --region us-east-1 --check

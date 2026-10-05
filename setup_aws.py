@@ -136,7 +136,7 @@ def _network(session, create=True):
     return vpc_id, subnets[:3], group_id
 
 
-def _secret(session, name, no_slack):
+def _secret(session, name, no_slack, token=None):
     client = session.client("secretsmanager")
     try:
         existing = client.describe_secret(SecretId=name)
@@ -148,7 +148,8 @@ def _secret(session, name, no_slack):
         return existing["ARN"] if existing else ""
     if existing:
         print("Slack token already stored in Secrets Manager; press Enter to keep it.")
-    token = getpass("Slack bot token (leave blank to keep/skip): ").strip()
+    token = (token if token is not None else
+             getpass("Slack bot token (leave blank to keep/skip): ")).strip()
     if token:
         if not token.startswith("xoxb-"):
             raise ValueError("expected a Slack bot token beginning xoxb-")
@@ -379,7 +380,8 @@ def provision(args):
     repo = _ecr(session, account, region)
     iam = session.client("iam")
     bucket_arn = f"arn:aws:s3:::{bucket}"
-    secret_arn = _secret(session, "suno-studio/slack-token", args.no_slack)
+    secret_arn = _secret(session, "suno-studio/slack-token", args.no_slack,
+                         getattr(args, "slack_token", None))
 
     execution_role = _role(iam, "suno-studio-ecs-execution", "ecs-tasks.amazonaws.com", [],
                            managed=("arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",))
@@ -436,8 +438,11 @@ def main(argv=None):
     parser.add_argument("--profile", help="named AWS CLI profile; default is the current one")
     parser.add_argument("--account", help="expected AWS account ID; abort if identity differs")
     parser.add_argument("--no-slack", action="store_true", help="skip Slack token setup")
+    parser.add_argument("--slack-token-stdin", action="store_true",
+                        help="read the optional Slack token from standard input")
     parser.add_argument("--check", action="store_true", help="read-only identity/network/quota check")
     args = parser.parse_args(argv)
+    args.slack_token = sys.stdin.readline().strip() if args.slack_token_stdin else None
     try:
         provision(args)
     except Exception as error:

@@ -21,3 +21,9 @@ does save resource identifiers and the private-link signing secret in the
 local config. If you configure Slack delivery, the Slack token is stored in
 AWS Secrets Manager for the delivery task. Do not create AWS access keys or
 share the local config file.
+
+An AWS profile name is only a label on the current computer. Each person who
+downloads the app must sign in to their own AWS account; the GitHub source and
+release ZIPs do not contain your local AWS profile, account configuration, or
+credentials. Cloud jobs are billed to the account shown by **Check account** in
+Settings.

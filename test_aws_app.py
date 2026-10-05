@@ -11,6 +11,53 @@ import setup_aws
 
 
 class AwsAppTests(unittest.TestCase):
+    def test_in_app_setup_requires_checked_identity_for_exact_profile_and_region(self):
+        with mock.patch.dict(app.AWS_SETUP, {"status": "idle", "checked": None,
+                                            "lines": []}), \
+                mock.patch.object(app.threading, "Thread") as worker:
+            with self.assertRaisesRegex(ValueError, "Check this AWS account"):
+                app.start_aws_setup("setup", "my-profile", "us-east-1")
+            worker.assert_not_called()
+            app.AWS_SETUP["checked"] = ("my-profile", "us-east-1", "123456789012")
+            with self.assertRaisesRegex(ValueError, "Check this AWS account"):
+                app.start_aws_setup("setup", "my-profile", "us-west-2")
+            app.start_aws_setup("setup", "my-profile", "us-east-1")
+            self.assertEqual(worker.call_args.kwargs["args"],
+                             ("setup", "my-profile", "us-east-1", "123456789012"))
+            snapshot = app.aws_setup_snapshot()
+            self.assertEqual(snapshot["account"], "123456789012")
+            self.assertEqual(snapshot["checked_profile"], "my-profile")
+
+    def test_in_app_setup_can_pass_slack_token_without_prompt(self):
+        secret = mock.Mock()
+        secret.describe_secret.side_effect = type("Missing", (Exception,), {
+            "response": {"Error": {"Code": "ResourceNotFoundException"}}})()
+        secret.create_secret.return_value = {"ARN": "arn:secret"}
+        session = mock.Mock()
+        session.client.return_value = secret
+        with mock.patch.object(setup_aws, "getpass", side_effect=AssertionError("prompted")):
+            arn = setup_aws._secret(session, "suno-studio/slack-token", False, "xoxb-test")
+        self.assertEqual(arn, "arn:secret")
+        self.assertEqual(secret.create_secret.call_args.kwargs["SecretString"], "xoxb-test")
+
+    def test_in_app_account_check_uses_existing_provisioner_without_creating(self):
+        process = mock.Mock(stdout=iter([
+            "AWS account 123456789012; region us-east-1; default VPC vpc-1; subnets subnet-1\n",
+            "Fargate On-Demand vCPU quota: 140\n"]))
+        process.wait.return_value = 0
+        with mock.patch.dict(app.AWS_SETUP, {"status": "checking", "checked": None,
+                                            "lines": []}), \
+                mock.patch.object(app, "install_aws_support"), \
+                mock.patch.object(app, "aws_support_python", return_value=Path("/tmp/python")), \
+                mock.patch.object(app.subprocess, "Popen", return_value=process) as launched:
+            app.run_aws_setup("check", "my-profile", "us-east-1")
+            command = launched.call_args.args[0]
+            self.assertIn("--check", command)
+            self.assertEqual(command[-3:], ["--profile", "my-profile", "--check"])
+            self.assertEqual(app.AWS_SETUP["checked"],
+                             ("my-profile", "us-east-1", "123456789012"))
+            self.assertEqual(app.AWS_SETUP["status"], "checked")
+
     def test_render_size_settings_reach_aws_dispatch_without_rebuild(self):
         with mock.patch.dict(app.CONFIG, {"aws_render_size": "large"}), \
                 mock.patch.object(app, "save_config"):

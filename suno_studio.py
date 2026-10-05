@@ -18,10 +18,12 @@ import email.header
 import email.utils
 import email.parser
 from email.message import EmailMessage
+import configparser
 import csv
 import colorsys
 import hashlib
 import http.server
+import importlib
 import imaplib
 import json
 import math
@@ -36,6 +38,7 @@ import ssl
 import subprocess
 import shutil
 import sys
+import venv
 import tempfile
 import threading
 import time
@@ -47,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.1"
+APP_VERSION = "6.0.2"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -74,7 +77,6 @@ DEFAULT_CONFIG = {
     "watch_seconds": 60,
     "default_style": "",
     "max_concurrent": 2,          # external API / encoder slots, not paused jobs
-    "suno_single_clip": True,
     # Hands-off mode. Off by default: mail lands in the approval inbox instead.
     # When on, a request only auto-fires if its sender matches allowed_senders.
     "auto_generate": False,
@@ -187,7 +189,7 @@ def load_config():
         cfg["lyric_y"] = 0.680
     # Retired artwork settings were mutually wired in an earlier UI.  Do not
     # preserve dead switches forever, and make old configuration safe to load.
-    for stale in ("save_cover", "use_cover_art"):
+    for stale in ("save_cover", "use_cover_art", "suno_single_clip"):
         if stale in cfg:
             cfg.pop(stale, None)
             CONFIG_NEEDS_MIGRATION = True
@@ -903,6 +905,143 @@ def aws_settings():
         "link_secret": CONFIG.get("aws_link_secret"),
         "render_size": CONFIG.get("aws_render_size", "large"),
     }
+
+
+AWS_SUPPORT = CONFIG_DIR / f"aws-env-py{sys.version_info.major}{sys.version_info.minor}"
+AWS_SETUP = {"status": "idle", "lines": [], "checked": None}
+AWS_SETUP_LOCK = threading.Lock()
+
+
+def aws_support_python():
+    return AWS_SUPPORT / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def load_aws_support():
+    """Make the app's private AWS packages available after setup and on restart."""
+    packages = (AWS_SUPPORT / "Lib/site-packages" if os.name == "nt" else
+                AWS_SUPPORT / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" /
+                "site-packages")
+    if packages.is_dir() and str(packages) not in sys.path:
+        sys.path.append(str(packages))
+        importlib.invalidate_caches()
+
+
+def install_aws_support():
+    requirements = Path(__file__).with_name("requirements-cloud.txt")
+    if not requirements.is_file():
+        raise RuntimeError("AWS support files are missing from this app download")
+    stamp = AWS_SUPPORT / ".requirements-sha256"
+    expected = hashlib.sha256(requirements.read_bytes()).hexdigest()
+    if not aws_support_python().exists():
+        venv.create(AWS_SUPPORT, with_pip=True)
+    if not stamp.exists() or stamp.read_text().strip() != expected:
+        result = subprocess.run([str(aws_support_python()), "-m", "pip", "install",
+                                 "--disable-pip-version-check", "-r", str(requirements)],
+                                capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            raise RuntimeError("Could not install AWS support. " +
+                               (result.stderr or result.stdout).strip()[-400:])
+        stamp.write_text(expected)
+    load_aws_support()
+
+
+load_aws_support()
+
+
+def aws_profiles():
+    config = configparser.RawConfigParser()
+    config.read(Path.home() / ".aws" / "config")
+    return sorted((section[8:] if section.startswith("profile ") else section)
+                  for section in config.sections()
+                  if section == "default" or section.startswith("profile "))
+
+
+def aws_setup_snapshot():
+    with AWS_SETUP_LOCK:
+        checked = AWS_SETUP["checked"] or ("", "", "")
+        return {"status": AWS_SETUP["status"], "lines": list(AWS_SETUP["lines"]),
+                "checked_profile": checked[0], "checked_region": checked[1],
+                "account": checked[2],
+                "profiles": aws_profiles(), "ready": aws_ready()}
+
+
+def run_aws_setup(action, profile, region, account=""):
+    def report(line):
+        # Never return credentials to a browser or persist setup output.
+        line = re.sub(r"xox[baprs]-\S+|AKIA[A-Z0-9]{16}", "[redacted]", line.strip())
+        if line:
+            with AWS_SETUP_LOCK:
+                AWS_SETUP["lines"] = (AWS_SETUP["lines"] + [line[:500]])[-30:]
+
+    try:
+        if action == "signin":
+            aws = shutil.which("aws") or next((p for p in
+                ("/usr/local/bin/aws", "/opt/homebrew/bin/aws") if Path(p).is_file()), None)
+            if not aws:
+                raise RuntimeError("Install AWS CLI v2 to sign in, then try again")
+            cmd = [aws, "sso", "login"] + (["--profile", profile] if profile else [])
+        else:
+            report("Installing AWS support (first use may take a few minutes)…")
+            install_aws_support()
+            cmd = [str(aws_support_python()), "-u",
+                   str(Path(__file__).with_name("setup_aws.py")), "--region", region]
+            if profile:
+                cmd += ["--profile", profile]
+            if action == "check":
+                cmd.append("--check")
+            else:
+                cmd += ["--account", account]
+                token = (CONFIG.get("slack_bot_token") or "").strip()
+                cmd.append("--slack-token-stdin" if token else "--no-slack")
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE if action == "setup" else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+        if action == "setup":
+            process.stdin.write((token or "") + "\n")
+            process.stdin.close()
+        for line in process.stdout:
+            report(line)
+        if process.wait():
+            raise RuntimeError("AWS " + action + " failed. See the last message above.")
+        with AWS_SETUP_LOCK:
+            if action == "check":
+                output = "\n".join(AWS_SETUP["lines"])
+                match = re.search(r"AWS account (\d{12}); region ([a-z0-9-]+);", output)
+                if not match or match.group(2) != region:
+                    raise RuntimeError("AWS identity check returned no account")
+                AWS_SETUP["checked"] = (profile, region, match.group(1))
+                AWS_SETUP["status"] = "checked"
+            else:
+                if action == "setup":
+                    saved = json.loads(CONFIG_PATH.read_text())
+                    CONFIG.update({k: v for k, v in saved.items() if k.startswith("aws_")})
+                AWS_SETUP["status"] = "done"
+    except Exception as error:
+        report(str(error))
+        with AWS_SETUP_LOCK:
+            AWS_SETUP["status"] = "error"
+
+
+def start_aws_setup(action, profile, region):
+    if action not in ("signin", "check", "setup"):
+        raise ValueError("Choose Sign in, Check account, or Set up AWS")
+    if not re.fullmatch(r"[A-Za-z0-9_.@/-]{0,80}", profile or ""):
+        raise ValueError("AWS profile name contains unsupported characters")
+    if not re.fullmatch(r"[a-z0-9-]{3,32}", region or ""):
+        raise ValueError("Enter a valid AWS region")
+    with AWS_SETUP_LOCK:
+        if AWS_SETUP["status"] in ("signing_in", "checking", "setting_up"):
+            raise ValueError("An AWS setup step is already running")
+        checked = AWS_SETUP["checked"]
+        if action == "setup" and (not checked or checked[:2] != (profile, region)):
+            raise ValueError("Check this AWS account and region before creating resources")
+        AWS_SETUP.update(status={"signin": "signing_in", "check": "checking",
+                                 "setup": "setting_up"}[action], lines=[])
+        if action != "setup":
+            AWS_SETUP["checked"] = None
+    threading.Thread(target=run_aws_setup,
+                     args=(action, profile, region, checked[2] if checked else ""),
+                     daemon=True).start()
 
 
 def aws_ready():
@@ -1696,8 +1835,7 @@ def run_job(job_id, form):
 
         # The documented Suno endpoint returns exactly two songs and exposes
         # no output-count field. Keep every returned clip as a selectable
-        # variant; `suno_single_clip` is a preference only until a provider
-        # offers a supported single-clip request parameter.
+        # variant; the provider has no supported output-count parameter.
         if len(tracks) > 1:
             log(f"provider returned {len(tracks)} clips; keeping all as variants")
 
@@ -6025,6 +6163,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
 
+        if u.path == "/api/aws/setup":
+            return self._json(aws_setup_snapshot())
+
         if u.path == "/api/subtitles":
             job_id = (q.get("job") or [""])[0]
             job = job_snapshot(job_id)
@@ -6071,6 +6212,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "auto_video": CONFIG.get("auto_video"),
                 "render_backend": CONFIG.get("render_backend", "local"),
                 "aws_ready": aws_ready(),
+                "aws_profile": CONFIG.get("aws_profile") or "",
                 "aws_region": CONFIG.get("aws_region") or "",
                 "aws_render_size": CONFIG.get("aws_render_size", "large"),
                 "video_height": CONFIG.get("video_height"),
@@ -6098,7 +6240,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "gate_song": CONFIG.get("gate_song", False),
                 "gate_image": CONFIG.get("gate_image", False),
                 "gate_video": CONFIG.get("gate_video", False),
-                "suno_single_clip": CONFIG.get("suno_single_clip", True),
                 "ffmpeg": find_ffmpeg() or "",
                 "ffmpeg_missing": missing_filters(find_ffmpeg()) if find_ffmpeg() else [],
             })
@@ -6152,6 +6293,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except BadRequest as e:
             return self._json({"error": str(e)}, 400)
 
+        if u.path == "/api/aws/setup":
+            if not isinstance(body, dict):
+                return self._json({"error": "expected setup details"}, 400)
+            origin = self.headers.get("Origin")
+            if (self.headers.get("X-Suno-Setup") != "1" or
+                    (origin and origin not in (f"http://{HOST}:{PORT}",
+                                               f"http://localhost:{PORT}"))):
+                return self._json({"error": "Open AWS setup from this app"}, 403)
+            try:
+                start_aws_setup(str(body.get("action") or ""),
+                                str(body.get("profile") or "").strip(),
+                                str(body.get("region") or "us-east-1").strip())
+                return self._json({"ok": True})
+            except ValueError as error:
+                return self._json({"error": str(error)}, 400)
+
         if u.path == "/api/config":
             if body.get("render_backend") in ("local", "aws"):
                 if body["render_backend"] == "aws" and not aws_ready():
@@ -6180,7 +6337,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 CONFIG["hybrid_repair"] = body["hybrid_repair"]
             for k in ("save_lyrics", "watch_enabled", "auto_generate", "auto_video",
                       "alerts_enabled",
-                      "art_title", "copy_path", "shimmer", "suno_single_clip",
+                      "art_title", "copy_path", "shimmer",
                       "gate_song", "gate_image", "gate_video",
                       "interlude_mode", "lyric_focus_band"):
                 if k in body:
@@ -6573,7 +6730,7 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
 label{display:block;font-size:12px;font-weight:600;color:var(--dim);
   text-transform:uppercase;letter-spacing:.06em;margin:14px 0 6px}
 label:first-child{margin-top:0}
-input[type=text],textarea,select{width:100%;background:var(--panel2);color:var(--ink);
+input[type=text],input[type=password],textarea,select{width:100%;background:var(--panel2);color:var(--ink);
   border:1px solid var(--line);border-radius:9px;padding:10px 12px;font:inherit;outline:none}
 input:focus,textarea:focus,select:focus{border-color:var(--accent)}
 textarea{resize:vertical;min-height:260px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -6669,6 +6826,7 @@ audio{width:100%;height:34px;filter:invert(.92) hue-rotate(180deg)}
 @keyframes sp{to{transform:rotate(360deg)}}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);
   border-radius:14px;padding:22px;max-width:520px;width:92%}
+#dlg{max-width:680px;max-height:85vh;overflow:auto}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
 .vtag{font-size:11px;font-weight:600;color:var(--dim);background:var(--panel2);
@@ -6812,8 +6970,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
 <dialog id="dlg">
   <h3 style="margin:0 0 4px">Settings</h3>
   <div class="hint">Changes are saved locally when you choose Save.</div>
-  <div class="gate-panel">
-    <b>Approval gates</b>
+  <details class="gate-panel"><summary>Approval steps</summary>
     <div class="hint">Turn a gate on to stop the pipeline at that stage until you approve it. Turn all three off for hands-off processing.</div>
     <label class="check"><input type="checkbox" id="s_gate_song"> Require approval after song generation</label>
     <div class="hint">Choose or edit a generated song before artwork starts.</div>
@@ -6821,7 +6978,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div class="hint">Choose or regenerate artwork before lyric-video rendering starts.</div>
     <label class="check"><input type="checkbox" id="s_gate_video"> Require approval after video rendering</label>
     <div class="hint">Inspect the finished video before publishing it to Final.</div>
-  </div>
+  </details>
   <div class="settings-section"><h4>Song creation &amp; folders</h4>
   <label>Provider</label>
   <select id="s_provider" onchange="providerChanged()"></select>
@@ -6841,12 +6998,10 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <summary>Pipeline storage &amp; capacity</summary>
     <div class="row"><div><label>Staging folder</label><input id="s_stage" placeholder="default: beside Final"></div><div><label>Rejects folder</label><input id="s_rejects" placeholder="default: beside Final"></div></div>
     <div class="row"><div><label>External calls at once</label><input id="s_cap" placeholder="2"></div><div><label>Reject purge (days)</label><input id="s_purge" placeholder="14"></div></div>
-    <label class="check"><input type="checkbox" id="s_oneclip"> Prefer one Suno clip per request</label>
-    <div class="hint">Current Suno API generation returns two clips and offers no supported count parameter; both are retained as variants.</div>
   </details>
   </div>
 
-  <div class="settings-section"><h4>Gmail intake</h4>
+  <details class="settings-section"><summary>Email intake and delivery</summary>
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_watch"> Watch Gmail for song requests</label>
   <div class="hint">Reads one label over IMAP. Never marks, moves, or deletes mail.</div>
 
@@ -6861,10 +7016,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <label>Default style <span style="text-transform:none;font-weight:400">(when an email doesn't specify one)</span></label>
   <input type="text" id="s_ds" placeholder="indie folk, acoustic guitar, warm">
 
-  <div class="row">
-    <div><label>Check every (sec)</label><input type="text" id="s_ws" placeholder="60"></div>
-    <div><label>Max at once</label><input type="text" id="s_mc" placeholder="2"></div>
-  </div>
+  <label>Check every (sec)</label><input type="text" id="s_ws" placeholder="60">
 
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_auto"> Skip approval and generate automatically</label>
   <div class="hint">Only fires for senders listed below. Leave the list empty and nothing auto-fires.</div>
@@ -6875,16 +7027,16 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <button class="ghost" onclick="testGmail()">Test Gmail connection</button>
     <span class="hint" style="margin:0" id="s_test"></span>
   </div>
-  </div>
+  </details>
 
-  <div class="settings-section"><h4>Slack delivery</h4>
+  <details class="settings-section"><summary>Slack delivery</summary>
   <label>Slack bot token</label>
   <input type="password" id="s_slack_token" placeholder="xoxb-… (leave blank to keep current)">
   <div class="hint" id="s_slack_state"></div>
   <div class="hint">Local Slack delivery uploads the approved MP4 to the selected channel. The bot needs file upload and channel posting permissions and must belong to the channel.</div>
-  </div>
+  </details>
 
-  <div class="settings-section"><h4>Alerts</h4>
+  <details class="settings-section"><summary>Credit alerts</summary>
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_al"> Warn me before the accounts run dry</label>
   <div class="hint">Checks kie.ai hourly. OpenAI publishes no balance, so that one is
   caught the first time it reports an exhausted quota.</div>
@@ -6892,15 +7044,26 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div><label>Warn under (kie.ai credits)</label><input type="text" id="s_alk" placeholder="100"></div>
     <div><label>Todoist API token</label><input type="password" id="s_tdt" placeholder="optional"></div>
   </div>
-  </div>
+  </details>
 
   <div class="settings-section"><h4>Lyric video</h4>
   <label>Video rendering</label>
   <select id="s_backend"><option value="local">On this computer</option><option value="aws">AWS parallel jobs</option></select>
   <div class="hint" id="s_backend_state"></div>
-  <label>AWS render task size</label>
-  <select id="s_aws_size"><option value="economy">2 vCPU · 4 GB</option><option value="balanced">4 vCPU · 8 GB</option><option value="large">8 vCPU · 16 GB (fastest measured)</option></select>
-  <div class="hint">Applies to newly dispatched AWS videos. Changing this does not rebuild the cloud image. Larger tasks cost more per minute and use more regional quota.</div>
+  <details id="aws_settings"><summary>AWS setup and task size</summary>
+    <p class="hint">AWS runs paid parallel video jobs. Profiles and credentials stay on this computer; each person connects their own AWS account. Check the account and region before creating resources there. That checked account pays for the jobs. You can change task size later without rebuilding the worker.</p>
+    <div class="row"><div><label for="s_aws_profile">AWS profile</label><input type="text" id="s_aws_profile" list="aws_profiles" oninput="awsAccountChanged()" placeholder="default or named SSO profile"><datalist id="aws_profiles"></datalist></div>
+      <div><label for="s_aws_region">AWS region</label><input type="text" id="s_aws_region" oninput="awsAccountChanged()" placeholder="us-east-1"></div></div>
+    <div class="hint">Profile sign-in requires <a href="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" target="_blank" rel="noreferrer">AWS CLI v2</a>. If you have no profile yet, follow the <a href="https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html" target="_blank" rel="noreferrer">AWS sign-in setup</a> once. No access keys are stored in Suno Studio.</div>
+    <div class="btns" style="margin-top:12px"><button type="button" class="ghost small" onclick="awsStep('signin')">Sign in</button>
+      <button type="button" class="ghost small" onclick="awsStep('check')">Check account</button>
+      <button type="button" class="small" id="s_aws_setup" onclick="awsStep('setup')" disabled>Create AWS resources</button></div>
+    <div class="hint" id="s_aws_account"></div>
+    <pre id="s_aws_log" class="mono" aria-live="polite" style="white-space:pre-wrap;max-height:190px;overflow:auto"></pre>
+    <label for="s_aws_size">Render task size</label>
+    <select id="s_aws_size"><option value="economy">2 vCPU · 4 GB</option><option value="balanced">4 vCPU · 8 GB</option><option value="large">8 vCPU · 16 GB (fastest measured)</option></select>
+    <div class="hint">Applies to new AWS videos. Larger tasks cost more per minute and use more regional quota. Measured three-minute samples cost about $0.01–$0.03 in render compute, plus storage and transfer.</div>
+  </details>
   <div class="row">
     <div><label style="margin-top:0">Resolution</label>
       <select id="s_vh"><option value="1080">1080p</option><option value="720">720p (faster)</option></select></div>
@@ -6909,7 +7072,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div><label style="margin-top:0">Visualizer</label>
       <select id="s_vis"><option value="bars">Spectrum bars</option><option value="wave">Waveform</option><option value="off">None</option></select></div>
   </div>
-  <label>Lyric timing</label>
+  <details><summary>Subtitle timing and output folder</summary><label>Lyric timing</label>
   <select id="s_align">
     <option value="section">Suno timing + section-safe alignment</option>
     <option value="stable-ts-hybrid">Local stable-ts hybrid (recommended)</option>
@@ -6926,9 +7089,12 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   <label>Video output folder <span style="text-transform:none;font-weight:400">(blank = beside the mp3)</span></label>
   <input type="text" id="s_vd" placeholder="~/Dropbox/SongVideos  - a watch folder, say">
   <div class="hint">Only the finished .mp4 goes here. Audio, artwork and subtitles stay with the song.</div>
+  </details>
+  <label class="check" style="margin-top:12px"><input type="checkbox" id="s_av"> Render a lyric video automatically after each song</label>
+  <div class="hint" id="s_ffstate"></div>
   </div>
 
-  <div class="settings-section"><h4>Image artwork</h4>
+  <details class="settings-section"><summary>Artwork and video effects</summary>
   <div class="hint" style="margin-top:8px">AI artwork is <b>off by default</b> - switch Background to
   "AI artwork" above. It uses your OpenAI key; the optional lyric focus band adds one masked image edit.</div>
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_arttitle"> Let the AI artwork letter the title (skips the drawn title)</label>
@@ -6941,7 +7107,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <option value="gpt-image-2">gpt-image-2 (best)</option>
     <option value="gpt-image-1">gpt-image-1 (cheaper)</option>
   </select>
-  <details open>
+  <details>
     <summary>Default image prompt (editable)</summary>
     <div class="hint">Edit these prompt building blocks to change every new image without a rebuild—seasonal themes included. Edited text stays yours; Reset restores the shipped wording.</div>
     <div id="s_fragments"></div>
@@ -6955,9 +7121,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <button class="ghost" onclick="testArt(this)">Test image generation</button>
     <span class="hint" style="margin:0" id="s_arttest"></span>
   </div>
-  <label class="check" style="margin-top:12px"><input type="checkbox" id="s_av"> Render a lyric video automatically after each song</label>
-  <div class="hint" id="s_ffstate"></div>
-  </div>
+  </details>
 
   <div class="actions">
     <button onclick="saveSettings()">Save</button>
@@ -7444,12 +7608,11 @@ function openSettings(){
     : 'Optional for local Slack delivery. Cloud delivery uses the token stored by cloud setup.';
   $('s_ds').value = CFG.default_style||'';
   $('s_ws').value = CFG.watch_seconds||60;
-  $('s_mc').value = CFG.max_concurrent||2;
   $('s_cap').value = CFG.max_concurrent||2;
   $('s_stage').value = CFG.staging_dir||''; $('s_rejects').value = CFG.rejects_dir||'';
   $('s_purge').value = CFG.reject_purge_days||14;
   $('s_gate_song').checked=!!CFG.gate_song; $('s_gate_image').checked=!!CFG.gate_image;
-  $('s_gate_video').checked=!!CFG.gate_video; $('s_oneclip').checked=CFG.suno_single_clip!==false;
+  $('s_gate_video').checked=!!CFG.gate_video;
   $('s_auto').checked = !!CFG.auto_generate;
   $('s_as').value = CFG.allowed_senders||'';
   $('s_test').textContent = '';
@@ -7459,7 +7622,9 @@ function openSettings(){
   $('s_backend').querySelector('option[value="aws"]').disabled = !CFG.aws_ready;
   $('s_backend_state').textContent = CFG.aws_ready
     ? `AWS configured in ${CFG.aws_region}. Sign in with the saved AWS profile before rendering; cloud jobs are billed per task.`
-    : 'Optional: run setup_aws.py to enable pay-per-use parallel rendering.';
+    : 'Optional pay-per-use parallel rendering. Open AWS setup below to connect your account.';
+  $('s_aws_profile').value = CFG.aws_profile||'';
+  $('s_aws_region').value = CFG.aws_region||'us-east-1';
   $('s_vis').value = CFG.visualizer||'bars';
   $('s_align').value = CFG.lyric_aligner||'section';
   $('s_repair').value = CFG.hybrid_repair||'local';
@@ -7489,6 +7654,47 @@ function openSettings(){
   $('s_path').textContent = 'Suno Studio v' + (CFG.version||'?') + '  ·  settings stored in ' + CFG.config_path;
   providerChanged();
   dlg.showModal();
+  refreshAwsSetup();
+}
+
+let awsChecked = null;
+function awsAccountChanged(){
+  $('s_aws_setup').disabled = !awsChecked ||
+    awsChecked.profile!==$('s_aws_profile').value.trim() ||
+    awsChecked.region!==$('s_aws_region').value.trim();
+}
+async function refreshAwsSetup(){
+  if(!dlg.open) return;
+  try{
+    const state=await (await fetch('/api/aws/setup')).json();
+    $('aws_profiles').innerHTML=(state.profiles||[]).map(p=>`<option value="${esc(p)}"></option>`).join('');
+    awsChecked=state.account ? {account:state.account,profile:state.checked_profile,region:state.checked_region} : null;
+    awsAccountChanged();
+    $('s_aws_account').textContent=state.account
+      ? `Checked account ${state.account} in ${state.checked_region}. AWS resources will be created there.`
+      : state.status==='idle' ? 'Check the AWS account before creating paid resources.' : '';
+    $('s_aws_log').textContent=(state.lines||[]).join('\n') ||
+      ({signing_in:'Waiting for AWS sign-in…',checking:'Checking AWS account…',
+        setting_up:'Creating AWS resources…'}[state.status]||'');
+    if(state.ready && !CFG.aws_ready){
+      CFG=await (await fetch('/api/config')).json();
+      $('s_backend').querySelector('option[value="aws"]').disabled=false;
+      $('s_backend_state').textContent=`AWS configured in ${CFG.aws_region}. Select AWS above and Save to use cloud rendering.`;
+    }
+    if(['signing_in','checking','setting_up'].includes(state.status)) setTimeout(refreshAwsSetup,1500);
+  }catch(e){ $('s_aws_log').textContent='Could not read AWS setup status: '+e.message; }
+}
+async function awsStep(action){
+  $('s_aws_setup').disabled=true;
+  $('s_aws_log').textContent='Starting '+action+'…';
+  try{
+    const result=await (await fetch('/api/aws/setup',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Suno-Setup':'1'},
+      body:JSON.stringify({action,profile:$('s_aws_profile').value.trim(),
+        region:$('s_aws_region').value.trim()})})).json();
+    if(result.error){ $('s_aws_log').textContent=result.error; awsAccountChanged(); return; }
+    refreshAwsSetup();
+  }catch(e){ $('s_aws_log').textContent='Could not start AWS setup: '+e.message; awsAccountChanged(); }
 }
 
 function renderFragments(){
@@ -7539,7 +7745,7 @@ async function saveSettings(){
                 staging_dir:$('s_stage').value, rejects_dir:$('s_rejects').value,
                 reject_purge_days:$('s_purge').value, gate_song:$('s_gate_song').checked,
                 gate_image:$('s_gate_image').checked, gate_video:$('s_gate_video').checked,
-                suno_single_clip:$('s_oneclip').checked, image_prompt_fragments:readFragments(),
+                image_prompt_fragments:readFragments(),
                 auto_generate:$('s_auto').checked, allowed_senders:$('s_as').value,
                 video_height:$('s_vh').value, render_backend:$('s_backend').value,
                 aws_render_size:$('s_aws_size').value,
