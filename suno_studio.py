@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.2"
+APP_VERSION = "6.0.3"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -1183,11 +1183,14 @@ def _delivery_lock(job_id):
 
 
 def slack_api_post(method, token, payload, uncertain_on_transport=False):
+    upload_slot = method == "files.getUploadURLExternal"
     request = urllib.request.Request(
         "https://slack.com/api/" + method,
-        data=json.dumps(payload).encode("utf-8"), method="POST",
+        data=(urllib.parse.urlencode(payload).encode("utf-8") if upload_slot else
+              json.dumps(payload).encode("utf-8")), method="POST",
         headers={"Authorization": "Bearer " + token,
-                 "Content-Type": "application/json; charset=utf-8"})
+                 "Content-Type": ("application/x-www-form-urlencoded" if upload_slot else
+                                  "application/json; charset=utf-8")})
     try:
         with urllib.request.urlopen(request, timeout=45) as response:
             result = json.loads(response.read().decode("utf-8"))
@@ -6727,6 +6730,8 @@ h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
   gap:20px;padding:20px 24px;max-width:1500px;margin:0 auto;align-items:start}
 @media(max-width:900px){.wrap{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+#manualcard{margin-top:0}
+#manualcard>summary{font-size:18px;color:var(--ink);text-transform:none;letter-spacing:0}
 label{display:block;font-size:12px;font-weight:600;color:var(--dim);
   text-transform:uppercase;letter-spacing:.06em;margin:14px 0 6px}
 label:first-child{margin-top:0}
@@ -6776,6 +6781,8 @@ details[open] summary:before{transform:rotate(90deg)}
 .progress{height:7px;margin-top:9px;background:var(--line);border-radius:999px;overflow:hidden}
 .progress>span{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
   border-radius:inherit;transition:width .35s ease}
+.progress.indeterminate>span{width:28%;animation:render-active 1.5s ease-in-out infinite}
+@keyframes render-active{from{transform:translateX(-100%)}to{transform:translateX(360%)}}
 .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.05em;
   text-transform:uppercase;padding:3px 8px;border-radius:20px;margin-left:8px;vertical-align:2px}
 .b-run{background:rgba(124,92,255,.16);color:#a48fff}
@@ -6827,6 +6834,7 @@ audio{width:100%;height:34px;filter:invert(.92) hue-rotate(180deg)}
 dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);
   border-radius:14px;padding:22px;max-width:520px;width:92%}
 #dlg{max-width:680px;max-height:85vh;overflow:auto}
+#awsdlg{max-width:680px;max-height:85vh;overflow:auto}
 dialog::backdrop{background:rgba(0,0,0,.6)}
 .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
 .vtag{font-size:11px;font-weight:600;color:var(--dim);background:var(--panel2);
@@ -6859,8 +6867,8 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div class="banner" id="alertbar" style="display:none"></div>
     <div class="watchbar" id="watchbar" style="display:none"></div>
 
-    <div class="card" id="manualcard" style="margin-bottom:20px">
-      <h2 style="font-size:18px;margin:0 0 3px">Create a Song</h2>
+    <details class="card" id="manualcard" style="margin-bottom:20px">
+      <summary>Create a Song</summary>
       <div class="hint">Enter a title, style, and lyrics to start a new song.</div>
       <label for="title">Title</label>
       <input type="text" id="title" placeholder="A title for your song">
@@ -6884,7 +6892,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
         <button id="go" onclick="generate()">Generate Song</button>
         <span class="hint" style="margin:0">Songs and videos remain available in Finished Jobs.</span>
       </div>
-    </div>
+    </details>
 
     <div class="card" id="inboxcard" style="display:none;margin-bottom:20px">
       <div style="display:flex;align-items:center;margin-bottom:12px">
@@ -7058,8 +7066,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div class="btns" style="margin-top:12px"><button type="button" class="ghost small" onclick="awsStep('signin')">Sign in</button>
       <button type="button" class="ghost small" onclick="awsStep('check')">Check account</button>
       <button type="button" class="small" id="s_aws_setup" onclick="awsStep('setup')" disabled>Create AWS resources</button></div>
-    <div class="hint" id="s_aws_account"></div>
-    <pre id="s_aws_log" class="mono" aria-live="polite" style="white-space:pre-wrap;max-height:190px;overflow:auto"></pre>
+    <button type="button" class="ghost small" onclick="openAwsProgress()">View setup status</button>
     <label for="s_aws_size">Render task size</label>
     <select id="s_aws_size"><option value="economy">2 vCPU · 4 GB</option><option value="balanced">4 vCPU · 8 GB</option><option value="large">8 vCPU · 16 GB (fastest measured)</option></select>
     <div class="hint">Applies to new AWS videos. Larger tasks cost more per minute and use more regional quota. Measured three-minute samples cost about $0.01–$0.03 in render compute, plus storage and transfer.</div>
@@ -7129,6 +7136,14 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <div class="spacer"></div>
   </div>
   <div class="hint mono" id="s_path"></div>
+</dialog>
+
+<dialog id="awsdlg">
+  <h3 style="margin:0 0 4px">AWS setup</h3>
+  <div class="hint" id="s_aws_account"></div>
+  <pre id="s_aws_log" class="mono" aria-live="polite" style="white-space:pre-wrap;max-height:45vh;overflow:auto"></pre>
+  <div class="hint">Closing this window hides the output; any setup already started continues.</div>
+  <div class="actions"><button class="ghost" onclick="awsdlg.close()">Close</button></div>
 </dialog>
 
 <dialog id="imageviewer" class="image-viewer" onclick="if(event.target===this)this.close()">
@@ -7527,11 +7542,14 @@ async function refresh(){
     const btn = revealPath ? `<button class="ghost small" style="margin-top:11px"
         onclick="reveal(${JSON.stringify(revealPath).replace(/"/g,'&quot;')})">Reveal in Finder</button>` : '';
     const src = (j.source && j.source!=='manual') ? ' · '+esc(j.source) : '';
-    const hasProgress = run && j.stage==='video' && j.phase==='render' &&
-      j.progress!==null && j.progress!==undefined && Number.isFinite(Number(j.progress));
+    const rendering = run && j.stage==='video' && j.phase==='render';
+    const hasProgress = rendering && j.progress!==null && j.progress!==undefined &&
+      Number.isFinite(Number(j.progress));
     const percent = hasProgress ? Math.max(0,Math.min(100,Number(j.progress))) : 0;
-    const progress = hasProgress ? `<div class="progress" role="progressbar" aria-label="Video render progress"
-      aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span style="width:${percent}%"></span></div>` : '';
+    const renderWhere = j.render_backend==='aws' ? 'AWS cloud' : 'this computer';
+    const progress = rendering ? `<div class="hint">Rendering on ${renderWhere}${hasProgress?' · '+Math.round(percent)+'%':''}</div>
+      <div class="progress${hasProgress?'':' indeterminate'}" role="progressbar" aria-label="Video render progress on ${renderWhere}"
+      ${hasProgress?`aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"`:''}><span${hasProgress?` style="width:${percent}%"`:''}></span></div>` : '';
     const body = j.pipeline
       ? pipelineButtons(j,songTracks,videoTracks,progress)
       : progress+songTracks+videoTracks;
@@ -7575,6 +7593,7 @@ async function quitApp(force){
 }
 
 const dlg = $('dlg');
+const awsdlg = $('awsdlg');
 const bugdlg = $('bugdlg');
 function openBugReport(){ $('bug_result').textContent=''; bugdlg.showModal(); previewBugReport(); }
 async function previewBugReport(){
@@ -7654,17 +7673,20 @@ function openSettings(){
   $('s_path').textContent = 'Suno Studio v' + (CFG.version||'?') + '  ·  settings stored in ' + CFG.config_path;
   providerChanged();
   dlg.showModal();
-  refreshAwsSetup();
 }
 
 let awsChecked = null;
+function openAwsProgress(){
+  if(!awsdlg.open) awsdlg.showModal();
+  refreshAwsSetup();
+}
 function awsAccountChanged(){
   $('s_aws_setup').disabled = !awsChecked ||
     awsChecked.profile!==$('s_aws_profile').value.trim() ||
     awsChecked.region!==$('s_aws_region').value.trim();
 }
 async function refreshAwsSetup(){
-  if(!dlg.open) return;
+  if(!awsdlg.open) return;
   try{
     const state=await (await fetch('/api/aws/setup')).json();
     $('aws_profiles').innerHTML=(state.profiles||[]).map(p=>`<option value="${esc(p)}"></option>`).join('');
@@ -7685,6 +7707,7 @@ async function refreshAwsSetup(){
   }catch(e){ $('s_aws_log').textContent='Could not read AWS setup status: '+e.message; }
 }
 async function awsStep(action){
+  if(!awsdlg.open) awsdlg.showModal();
   $('s_aws_setup').disabled=true;
   $('s_aws_log').textContent='Starting '+action+'…';
   try{

@@ -12,13 +12,13 @@ rendering can encode several videos at once.
 ## Download and start
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.2-macOS.zip` for the Mac app, or
-   `SunoStudio-6.0.2-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.3-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0.3-source.zip` for the source and Windows launcher.
 2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
    [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
    `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
    [setup guide](SETUP.md) has checks for macOS and Windows.
-3. Extract the ZIP. On macOS, move **Suno Studio 6.0.2.app** to Applications
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.3.app** to Applications
    and double-click it. On Windows, extract the full source ZIP folder
    and double-click **Start Suno Studio.bat** inside it. Keep the launcher
    beside `suno_studio.py`.
@@ -36,6 +36,12 @@ those runtimes.
 The local app needs no Python packages or cloud account. Gmail, OpenAI, AWS,
 and Slack are optional. See [SETUP.md](SETUP.md) for optional services and
 troubleshooting.
+
+Version 6.0.3 fixes Slack MP4 delivery, starts **Create a Song** collapsed,
+shows local or AWS rendering during video creation, and moves AWS setup output
+to a closable window. An existing AWS installation should run **Create AWS
+resources** again in Settings to deploy the updated cloud delivery worker;
+the local Slack fix works immediately after installing the new app.
 
 ## Creation and delivery
 

@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,19 @@ CONFIG = {"region": "us-east-1", "bucket": "private-bucket", "cluster": "cluster
 
 
 class AWSRenderTests(unittest.TestCase):
+    def test_worker_requests_slack_upload_slot_as_form_data(self):
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        with patch.object(aws_worker.urllib.request, "urlopen", return_value=response) as opened:
+            aws_worker._slack("files.getUploadURLExternal", "xoxb-test",
+                              {"filename": "video.mp4", "length": 9})
+        request = opened.call_args.args[0]
+        self.assertEqual(request.get_header("Content-type"),
+                         "application/x-www-form-urlencoded")
+        self.assertEqual(urllib.parse.parse_qs(request.data.decode()),
+                         {"filename": ["video.mp4"], "length": ["9"]})
+
     def test_manifest_contains_only_prepared_assets_and_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

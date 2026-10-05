@@ -38,8 +38,8 @@ retry does not regenerate the song or video.
 
 ## Release downloads
 
-Download `SunoStudio-6.0.2-macOS.zip` or
-`SunoStudio-6.0.2-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.3-macOS.zip` or
+`SunoStudio-6.0.3-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -52,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.2-macOS.zip` for the Mac app or
-   `SunoStudio-6.0.2-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.3-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.3-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -62,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.2.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.3.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.

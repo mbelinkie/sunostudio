@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 from pathlib import Path
 
@@ -357,6 +358,11 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(receipt["channel_id"], "C123ABC")
             self.assertEqual(receipt["permalink"], "https://slack.example/file")
             self.assertEqual(request.call_count, 3)
+            slot_request = request.call_args_list[0].args[0]
+            self.assertEqual(slot_request.get_header("Content-type"),
+                             "application/x-www-form-urlencoded")
+            self.assertEqual(urllib.parse.parse_qs(slot_request.data.decode()),
+                             {"filename": ["video.mp4"], "length": ["9"]})
             completion = json.loads(request.call_args_list[2].args[0].data)
             self.assertEqual(completion["channel_id"], "C123ABC")
 

@@ -193,10 +193,14 @@ def render(manifest_uri):
 
 
 def _slack(method, token, params):
+    upload_slot = method == "files.getUploadURLExternal"
     request = urllib.request.Request(
         f"https://slack.com/api/{method}",
-        data=json.dumps(params).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        data=(urllib.parse.urlencode(params).encode() if upload_slot else
+              json.dumps(params).encode()),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": ("application/x-www-form-urlencoded" if upload_slot else
+                                  "application/json")},
         method="POST")
     with urllib.request.urlopen(request, timeout=30) as response:
         data = json.load(response)
