@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.4"
+APP_VERSION = "6.0.5"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -1075,7 +1075,9 @@ def cloud_slack_for_job(job):
         try:
             execution = aws_render.dispatch_slack_delivery(
                 config, job["id"], attempt, cloud_video or job["final_path"],
-                job["delivery_destination"])
+                job["delivery_destination"],
+                (job.get("current_fields") or {}).get("caption") or "",
+                Path(job["final_path"]).name)
         except Exception as error:
             execution = aws_render.reconcile_render(config, {
                 "attempt_id": attempt,
@@ -1164,6 +1166,10 @@ def delivery_details(fields):
 def normalize_delivery_fields(fields):
     """Copy a request form while preserving its explicit delivery selection."""
     result = dict(fields or {})
+    caption = re.sub(r"\s+", " ", str(result.get("caption") or "")).strip()
+    if len(caption) >= 240:
+        raise ValueError("Song Caption must be shorter than 240 characters.")
+    result["caption"] = caption
     mode, destination, error = delivery_details(result)
     result["delivery_mode"] = mode
     raw_recipient = str(result.get("recipient") or "").strip()
@@ -1204,7 +1210,7 @@ def slack_api_post(method, token, payload, uncertain_on_transport=False):
     return result
 
 
-def slack_upload_mp4(video_path, channel_id, token):
+def slack_upload_mp4(video_path, channel_id, token, caption=""):
     """Upload one MP4 with Slack's external-file upload flow."""
     video_path = Path(video_path)
     if not video_path.is_file():
@@ -1244,7 +1250,7 @@ def slack_upload_mp4(video_path, channel_id, token):
         "files.completeUploadExternal", token,
         {"files": [{"id": file_id, "title": filename}],
          "channel_id": channel_id,
-         "initial_comment": f"Video: {filename}"},
+         "initial_comment": caption or f"Video: {filename}"},
         uncertain_on_transport=True)
     file_info = (complete.get("files") or [{}])[0]
     return {"provider": "slack", "file_id": file_id,
@@ -1270,8 +1276,9 @@ def send_email_delivery(job):
     message["From"] = user
     message["To"] = recipient
     message["Message-ID"] = email.utils.make_msgid()
+    caption = (fields.get("caption") or "").strip()
     message.set_content(
-        "Your approved Suno Studio video is ready.\n\n"
+        (f"{caption}\n\n" if caption else "Your approved Suno Studio video is ready.\n\n") +
         f"Download it privately here: {url}\n\n"
         "This link expires in three days. Your local MP4 remains available in Suno Studio.")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465,
@@ -1327,7 +1334,8 @@ def send_job_delivery(job_id, allow_uncertain_retry=False):
         else:
             receipt = slack_upload_mp4(
                 job["final_path"], destination,
-                (CONFIG.get("slack_bot_token") or "").strip())
+                (CONFIG.get("slack_bot_token") or "").strip(),
+                fields.get("caption") or "")
         set_job(job_id, delivery_status="sent", delivery_error="",
                 delivery_receipt=receipt or {"provider": mode},
                 delivered_at=time.time())
@@ -1613,8 +1621,9 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
     if fields:
         current.update({k: v for k, v in fields.items() if k in {
             "title", "tagline", "style", "lyrics", "infographic", "model", "instrumental",
-            "negativeTags", "recipient", "delivery_mode", "slack_channel_id",
+            "negativeTags", "recipient", "delivery_mode", "slack_channel_id", "caption",
             "vocalGender", "styleWeight", "weirdnessConstraint"}})
+        current = normalize_delivery_fields(current)
         stale = (current.get("lyrics") != (job.get("current_fields") or {}).get("lyrics") or
                  current.get("style") != (job.get("current_fields") or {}).get("style"))
         set_job(job_id, current_fields=current, title=(current.get("title") or "Untitled"),
@@ -5522,6 +5531,7 @@ FIELD_ALIASES = {
     "display lyrics": "display_lyrics",
     "sprint": "tagline", "tagline": "tagline", "subtitle": "tagline",
     "infographic": "infographic", "screen": "infographic",
+    "caption": "caption", "song caption": "caption",
     "email": "recipient", "notify": "recipient", "requester": "recipient",
     "to": "recipient", "reply": "recipient", "replyto": "recipient",
     "recipient": "recipient", "delivery": "delivery_mode",
@@ -5694,7 +5704,7 @@ def split_sections(text):
     # the end of another section. Split it at the first [Verse]-style tag.
     if not hits.get("lyrics"):
         for k, v in list(hits.items()):
-            if k == "lyrics":
+            if k in ("lyrics", "caption"):
                 continue
             rows = v.split("\n")
             at = next((i for i, r in enumerate(rows) if re.match(r"^\s*\[[^\]]+\]\s*$", r)), None)
@@ -5794,6 +5804,7 @@ def parse_request(subject, body, default_style=""):
             "negativeTags": (sect.get("negativeTags") or "").strip(),
             "tagline": (sect.get("tagline") or "").strip(),
             "infographic": scrub_scaffolding(sect.get("infographic", "")),
+            "caption": sect.get("caption", ""),
             "recipient": sect.get("recipient") or "",
             "delivery_mode": sect.get("delivery_mode", "none"),
             "slack_channel_id": sect.get("slack_channel_id", ""),
@@ -5838,6 +5849,7 @@ def parse_request(subject, body, default_style=""):
         "negativeTags": fields.get("negativeTags", ""),
         "tagline": fields.get("tagline", "").strip(),
         "infographic": fields.get("infographic", "").strip(),
+        "caption": fields.get("caption", ""),
         "recipient": fields.get("recipient", ""),
         "delivery_mode": fields.get("delivery_mode", "none"),
         "slack_channel_id": fields.get("slack_channel_id", ""),
@@ -7347,6 +7359,7 @@ function gateFields(job){
 function deliveryFields(job){
   const fields=gateFields(job), mode=$(fieldId(job,'delivery_mode'))?.value||'none';
   fields.delivery_mode=mode;
+  fields.caption=$(fieldId(job,'caption'))?.value||'';
   fields.recipient=mode==='email'?($(fieldId(job,'recipient'))?.value||''):'';
   fields.slack_channel_id=mode==='slack'?($(fieldId(job,'slack_channel_id'))?.value||''):'';
   return fields;
@@ -7361,7 +7374,7 @@ function deliveryEditor(j){
   const id=j.id, f=j.current_fields||{}, mode=f.delivery_mode||'none';
   const invalid=!['none','email','slack'].includes(mode);
   const options=`${invalid?`<option value="${esc(mode)}" selected>Invalid choice: ${esc(mode)}</option>`:''}<option value="none" ${mode==='none'?'selected':''}>None</option><option value="slack" ${mode==='slack'?'selected':''}>Slack</option><option value="email" ${mode==='email'?'selected':''}>Email</option>`;
-  return `<div class="delivery-review"><label>Delivery</label><select id="${fieldId(id,'delivery_mode')}" onchange="deliveryModeChanged('${id}')">${options}</select><div id="${fieldId(id,'email_target')}" ${mode==='email'?'':'hidden'}><label>Recipient</label><input type="text" id="${fieldId(id,'recipient')}" value="${esc(f.recipient||'')}" placeholder="name@example.com"></div><div id="${fieldId(id,'slack_target')}" ${mode==='slack'?'':'hidden'}><label>Slack Channel ID</label><input type="text" id="${fieldId(id,'slack_channel_id')}" value="${esc(f.slack_channel_id||'')}" placeholder="C0123456789"></div><div class="hint">A delivery problem keeps the approved local MP4 and can be corrected here without rendering again.</div></div>`;
+  return `<div class="delivery-review"><label for="${fieldId(id,'caption')}">Song Caption</label><input type="text" id="${fieldId(id,'caption')}" value="${esc(f.caption||'')}" maxlength="239" placeholder="Optional message to accompany the video"><label>Delivery</label><select id="${fieldId(id,'delivery_mode')}" onchange="deliveryModeChanged('${id}')">${options}</select><div id="${fieldId(id,'email_target')}" ${mode==='email'?'':'hidden'}><label>Recipient</label><input type="text" id="${fieldId(id,'recipient')}" value="${esc(f.recipient||'')}" placeholder="name@example.com"></div><div id="${fieldId(id,'slack_target')}" ${mode==='slack'?'':'hidden'}><label>Slack Channel ID</label><input type="text" id="${fieldId(id,'slack_channel_id')}" value="${esc(f.slack_channel_id||'')}" placeholder="C0123456789"></div><div class="hint">A delivery problem keeps the approved local MP4 and can be corrected here without rendering again.</div></div>`;
 }
 async function retryDelivery(job, status, mode){
   const fields=deliveryFields(job);

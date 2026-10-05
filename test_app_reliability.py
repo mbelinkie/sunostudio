@@ -129,6 +129,63 @@ class ReliabilityTests(unittest.TestCase):
                          ("email", "author@example.com"))
         self.assertEqual(section_form["slack_channel_id"], "C456DEF")
 
+    def test_caption_section_is_separate_and_old_email_still_parses(self):
+        body = ("===TITLE===\nShanty\n===LYRICS===\n[Verse]\nSail on\n"
+                "===DISPLAY LYRICS===\n[Verse]\nSail on\n"
+                "===INFOGRAPHIC===\nA bright harbor\n"
+                "===CAPTION===\nHoist the sails—our upgrade deserves a shanty!\n"
+                "===END===")
+        form = app.parse_request("Shanty", body)
+        self.assertEqual(form["caption"], "Hoist the sails—our upgrade deserves a shanty!")
+        self.assertEqual(form["lyrics"], "[Verse]\nSail on")
+        self.assertEqual(form["display_lyrics"], "[Verse]\nSail on")
+        self.assertEqual(form["infographic"], "A bright harbor")
+        self.assertEqual(app.parse_request("Old", body.replace(
+            "===CAPTION===\nHoist the sails—our upgrade deserves a shanty!\n", ""))["caption"], "")
+        header = app.parse_request("Header", "Title: Header\nCaption: Our launch has a jazz groove.\n"
+                                   "---\n[Verse]\nKeep moving")
+        self.assertEqual(header["caption"], "Our launch has a jazz groove.")
+        self.assertEqual(header["lyrics"], "[Verse]\nKeep moving")
+
+    def test_caption_approval_and_retry_survive_journal_reload(self):
+        old_jobs, old_forms, old_path = app.JOBS, app.JOB_FORMS, app.JOBS_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                app.JOBS_PATH = Path(td) / "jobs.json"
+                app.JOBS, app.JOB_FORMS = {"job": {
+                    "id": "job", "pipeline": True, "status": "paused_video", "stage": "video",
+                    "current_fields": {"title": "Song", "caption": "Original",
+                                       "delivery_mode": "slack", "slack_channel_id": "C123ABC"}}}, {}
+                with mock.patch.object(app, "finalize_pipeline_job"):
+                    app.pipeline_action("job", "approve_video", {"caption": "Approved caption"})
+                jobs, _ = app.load_jobs()
+                self.assertEqual(jobs["job"]["current_fields"]["caption"], "Approved caption")
+                video = Path(td) / "song.mp4"
+                video.write_bytes(b"saved video")
+                app.set_job("job", status="completed", final_path=str(video),
+                            delivery_status="error")
+                with mock.patch.object(app.threading, "Thread") as thread:
+                    app.pipeline_action("job", "retry_delivery", {"caption": "Revised caption"})
+                self.assertTrue(thread.called)
+                jobs, _ = app.load_jobs()
+                self.assertEqual(jobs["job"]["current_fields"]["caption"], "Revised caption")
+                self.assertEqual(jobs["job"]["delivery_status"], "queued")
+                app.JOBS = jobs
+                with mock.patch.object(app, "slack_upload_mp4", return_value={"file_id": "F123"}) as upload:
+                    app.send_job_delivery("job")
+                self.assertEqual(upload.call_args.args[-1], "Revised caption")
+                self.assertEqual(app.load_jobs()[0]["job"]["delivery_status"], "sent")
+        finally:
+            app.JOBS, app.JOB_FORMS, app.JOBS_PATH = old_jobs, old_forms, old_path
+
+    def test_caption_is_escaped_in_approval_editor_and_limited(self):
+        self.assertIn("value=\"${esc(f.caption||'')}\"", app.PAGE)
+        self.assertIn("fields.caption=$(fieldId(job,'caption'))?.value||'';", app.PAGE)
+        self.assertEqual(app.normalize_delivery_fields({"caption": "  Sail <on>  "})["caption"],
+                         "Sail <on>")
+        with self.assertRaisesRegex(ValueError, "shorter than 240"):
+            app.normalize_delivery_fields({"caption": "x" * 240})
+
     def test_delivery_is_none_by_default_even_when_destinations_are_present(self):
         form = app.parse_request(
             "Song", "Recipient: author@example.com\nSlack Channel ID: C123ABC\n---\n[Verse]\nWords")
@@ -293,15 +350,22 @@ class ReliabilityTests(unittest.TestCase):
                     "final_path": str(video), "title": "Song",
                     "delivery_mode": "email", "delivery_destination": "reader@example.com",
                     "delivery_status": "queued", "current_fields": {
-                        "delivery_mode": "email", "recipient": "reader@example.com"}}}
+                        "delivery_mode": "email", "recipient": "reader@example.com",
+                        "caption": "Our launch has a jazz groove."}}}
                 with mock.patch.object(app.smtplib, "SMTP_SSL", return_value=SMTP()), \
                         mock.patch.object(app, "_save_jobs_locked"):
                     app.send_job_delivery("job")
+                    app.send_email_delivery({"id": "job", "title": "Song",
+                        "delivery_destination": "reader@example.com",
+                        "current_fields": {"recipient": "reader@example.com", "caption": ""}})
                 job = app.JOBS["job"]
                 self.assertEqual(job["status"], "completed")
                 self.assertEqual(job["delivery_status"], "sent")
                 self.assertEqual(job["delivery_receipt"]["recipient"], "reader@example.com")
                 self.assertIn("https://private.example/valid-seven-days", sent[0].get_content())
+                self.assertTrue(sent[0].get_content().startswith("Our launch has a jazz groove.\n"))
+                self.assertTrue(sent[1].get_content().startswith(
+                    "Your approved Suno Studio video is ready.\n"))
         finally:
             app.JOBS, app.EMAIL_LINK_FACTORY = old_jobs, old_factory
             app.CONFIG.clear(); app.CONFIG.update(old_config)
@@ -353,7 +417,8 @@ class ReliabilityTests(unittest.TestCase):
             video = Path(td) / "video.mp4"
             video.write_bytes(b"mp4-bytes")
             with mock.patch.object(app.urllib.request, "urlopen", side_effect=responses) as request:
-                receipt = app.slack_upload_mp4(video, "C123ABC", "xoxb-test")
+                receipt = app.slack_upload_mp4(video, "C123ABC", "xoxb-test",
+                                               "Our launch has a jazz groove.")
             self.assertEqual(receipt["file_id"], "F123")
             self.assertEqual(receipt["channel_id"], "C123ABC")
             self.assertEqual(receipt["permalink"], "https://slack.example/file")
@@ -365,6 +430,12 @@ class ReliabilityTests(unittest.TestCase):
                              {"filename": ["video.mp4"], "length": ["9"]})
             completion = json.loads(request.call_args_list[2].args[0].data)
             self.assertEqual(completion["channel_id"], "C123ABC")
+            self.assertEqual(completion["initial_comment"], "Our launch has a jazz groove.")
+            self.assertEqual(completion["files"][0]["title"], "video.mp4")
+            with mock.patch.object(app.urllib.request, "urlopen", side_effect=responses) as request:
+                app.slack_upload_mp4(video, "C123ABC", "xoxb-test")
+            completion = json.loads(request.call_args_list[2].args[0].data)
+            self.assertEqual(completion["initial_comment"], "Video: video.mp4")
 
     def test_slack_upload_failure_does_not_expose_its_temporary_upload_url(self):
         class Response:

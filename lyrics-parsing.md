@@ -75,6 +75,11 @@ full display line receives one highlight and the subtitle doctor reports it.
 `===SLACK ID===` is accepted as channel metadata after `===EMAIL===`; it does
 not select Slack delivery. Delivery still requires the explicit delivery mode.
 
+`===CAPTION===` is optional metadata after `===INFOGRAPHIC===`. Its sentence is
+saved with the request for final approval and delivery; it is never sent to
+Suno or used for subtitles or infographic artwork. Older emails without it
+retain the standard delivery message.
+
 ---
 
 ## Stage 1 — Email body to fields
@@ -106,6 +111,9 @@ FIELD_ALIASES = {
     "vocal": "vocalGender", "vocals": "vocalGender", "voice": "vocalGender",
     "exclude": "negativeTags", "avoid": "negativeTags", "negative": "negativeTags",
     "lyrics": "lyrics", "words": "lyrics", "lyric": "lyrics",
+    "display lyrics": "display_lyrics",
+    "infographic": "infographic", "screen": "infographic",
+    "caption": "caption", "song caption": "caption",
     "sprint": "tagline", "tagline": "tagline", "subtitle": "tagline",
     "email": "recipient", "notify": "recipient", "requester": "recipient",
     "to": "recipient", "reply": "recipient", "replyto": "recipient",

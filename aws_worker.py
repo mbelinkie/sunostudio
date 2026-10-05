@@ -93,6 +93,12 @@ def _manifest(uri, mode):
         if set(assets) != {"video"} or not re.fullmatch(r"[CGD][A-Z0-9]{8,}",
                                                         str(settings.get("channel_id", ""))):
             raise ValueError("invalid delivery assets or destination")
+        caption = settings.get("caption", "")
+        filename = settings.get("filename", f"{job_id}.mp4")
+        if (not isinstance(caption, str) or len(caption) >= 240 or
+                not isinstance(filename, str) or len(filename) > 255 or
+                filename != Path(filename).name or not filename.lower().endswith(".mp4")):
+            raise ValueError("invalid delivery caption or filename")
         if manifest.get("result_uri") != f"s3://{bucket}/delivery-results/{job_id}/{attempt_id}/result.json":
             raise ValueError("invalid delivery result location")
         if manifest.get("output_uri") is not None:
@@ -241,13 +247,16 @@ def deliver(manifest_uri):
         token = _client("secretsmanager").get_secret_value(SecretId=secret_arn)["SecretString"]
         with tempfile.TemporaryDirectory(prefix="suno-delivery-") as temporary:
             video = _download(manifest["assets"]["video"], Path(temporary) / "video.mp4")
+            filename = manifest["settings"].get("filename") or f"{manifest['job_id']}.mp4"
+            caption = manifest["settings"].get("caption") or f"Video: {filename}"
             upload = _slack("files.getUploadURLExternal", token, {
-                "filename": f"{manifest['job_id']}.mp4", "length": video.stat().st_size})
+                "filename": filename, "length": video.stat().st_size})
             _upload_bytes(upload["upload_url"], video)
             try:
                 completed = _slack("files.completeUploadExternal", token, {
-                    "files": [{"id": upload["file_id"]}],
-                    "channel_id": manifest["settings"]["channel_id"]})
+                    "files": [{"id": upload["file_id"], "title": filename}],
+                    "channel_id": manifest["settings"]["channel_id"],
+                    "initial_comment": caption})
             except Exception as error:
                 result.update(status="uncertain", uncertain=True,
                               file_id=upload["file_id"], error=str(error)[:200])

@@ -38,8 +38,8 @@ retry does not regenerate the song or video.
 
 ## Release downloads
 
-Download `SunoStudio-6.0.4-macOS.zip` or
-`SunoStudio-6.0.4-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.5-macOS.zip` or
+`SunoStudio-6.0.5-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -52,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.4-macOS.zip` for the Mac app or
-   `SunoStudio-6.0.4-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.5-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.5-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -62,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.4.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.5.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.
@@ -121,10 +121,14 @@ Email intake accepts the following fields in either supported request layout:
 Delivery: Slack | Email | None
 Slack Channel ID: C0123456789
 Recipient: name@example.com
+Caption: A short sentence to accompany the finished video.
 ```
 
 In the section-block layout, use `===DELIVERY===`, `===SLACK CHANNEL ID===`,
-and `===RECIPIENT===`, with each value on the line below its marker.
+`===RECIPIENT===`, and optional `===CAPTION===`, with each value on the line
+below its marker. Put `===CAPTION===` after `===INFOGRAPHIC===` and before
+`===END===`. The caption is plain text under 240 characters. It does not go to
+Suno or appear in the video. You can edit it on the final video approval screen.
 
 The delivery choice defaults to None when omitted. Slack delivery requires an
 explicit channel ID. Email is sent through the configured Gmail account after
@@ -132,6 +136,8 @@ video approval; Slack receives the approved MP4 directly. For emailed videos,
 the app sends a private download link that expires after three days. If
 delivery details are missing or sending fails, correct the details and retry
 delivery without making the video again.
+For Slack, the caption replaces the “Video: filename” message above the file;
+for email, it opens the message. An empty caption keeps the usual text.
 
 ## AWS Fargate setup, cost, retention, and cleanup
 

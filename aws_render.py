@@ -179,7 +179,7 @@ def dispatch_render(config, job_id, attempt, assets, settings):
     return _dispatch(config, job_id, attempt, assets, settings, "render")
 
 
-def dispatch_slack_delivery(config, job_id, attempt, mp4, channel_id):
+def dispatch_slack_delivery(config, job_id, attempt, mp4, channel_id, caption="", filename=""):
     if not re.fullmatch(r"[CGD][A-Z0-9]{8,}", str(channel_id or "")):
         raise ValueError("a Slack channel ID is required")
     config = _config(config)
@@ -202,9 +202,16 @@ def dispatch_slack_delivery(config, job_id, attempt, mp4, channel_id):
         video = _upload_file(config, mp4, f"delivery-inputs/{job_id}/{attempt}/video.mp4")
     prefix = f"delivery-inputs/{job_id}/{attempt}"
     result_uri = _uri(config, f"delivery-results/{job_id}/{attempt}/result.json")
+    caption = " ".join(str(caption or "").split())
+    if len(caption) >= 240:
+        raise ValueError("Song Caption must be shorter than 240 characters")
+    filename = Path(filename).name if filename else f"{job_id}.mp4"
+    if not filename.lower().endswith(".mp4") or len(filename) > 255:
+        raise ValueError("delivery filename must be an MP4 basename")
     manifest = {"schema_version": 1, "mode": "delivery", "job_id": job_id,
                 "attempt_id": attempt, "assets": {"video": video},
-                "settings": {"channel_id": channel_id}, "result_uri": result_uri}
+                "settings": {"channel_id": channel_id, "caption": caption,
+                             "filename": filename}, "result_uri": result_uri}
     manifest_uri = _put_json_once(config, f"{prefix}/manifest.json", manifest)
     task_arn = _run_task(config, "delivery", attempt, manifest_uri)
     return {"mode": "delivery", "attempt_id": attempt, "job_id": job_id,

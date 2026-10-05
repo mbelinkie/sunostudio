@@ -55,6 +55,62 @@ class AWSRenderTests(unittest.TestCase):
         self.assertEqual(urllib.parse.parse_qs(request.data.decode()),
                          {"filename": ["video.mp4"], "length": ["9"]})
 
+    def test_cloud_delivery_uses_caption_and_descriptive_file_title(self):
+        manifest = {"job_id": "job12345", "attempt_id": "attempt12345",
+                    "assets": {"video": {}}, "result_uri": "s3://private-bucket/result.json",
+                    "settings": {"channel_id": "C12345678", "caption": "A jazzy launch!",
+                                 "filename": "Sprint - Song.mp4"}}
+        calls = []
+
+        def download(_asset, target):
+            target.write_bytes(b"mp4")
+            return target
+
+        def slack(method, _token, payload):
+            calls.append((method, payload))
+            return ({"file_id": "F123", "upload_url": "https://upload.example"}
+                    if method == "files.getUploadURLExternal" else {"files": [{}]})
+
+        secret = unittest.mock.MagicMock()
+        secret.get_secret_value.return_value = {"SecretString": "xoxb-test"}
+        with patch.dict("os.environ", {"SLACK_SECRET_ARN": "arn:secret"}), \
+                patch.object(aws_worker, "_manifest", return_value=manifest), \
+                patch.object(aws_worker, "_client", return_value=secret), \
+                patch.object(aws_worker, "_download", side_effect=download), \
+                patch.object(aws_worker, "_slack", side_effect=slack), \
+                patch.object(aws_worker, "_upload_bytes"), \
+                patch.object(aws_worker, "_put_json"):
+            self.assertEqual(aws_worker.deliver("s3://private-bucket/manifest.json")["status"],
+                             "succeeded")
+        self.assertEqual(calls[0][1]["filename"], "Sprint - Song.mp4")
+        self.assertEqual(calls[1][1]["files"][0]["title"], "Sprint - Song.mp4")
+        self.assertEqual(calls[1][1]["initial_comment"], "A jazzy launch!")
+        manifest["settings"]["caption"] = ""
+        calls.clear()
+        with patch.dict("os.environ", {"SLACK_SECRET_ARN": "arn:secret"}), \
+                patch.object(aws_worker, "_manifest", return_value=manifest), \
+                patch.object(aws_worker, "_client", return_value=secret), \
+                patch.object(aws_worker, "_download", side_effect=download), \
+                patch.object(aws_worker, "_slack", side_effect=slack), \
+                patch.object(aws_worker, "_upload_bytes"), \
+                patch.object(aws_worker, "_put_json"):
+            aws_worker.deliver("s3://private-bucket/manifest.json")
+        self.assertEqual(calls[1][1]["initial_comment"], "Video: Sprint - Song.mp4")
+
+    def test_delivery_manifest_carries_approved_caption(self):
+        manifests = []
+        with patch.object(aws_render, "_upload_file", return_value={
+                "uri": "s3://private-bucket/delivery-inputs/job12345/attempt12345/video.mp4",
+                "sha256": "a" * 64, "size": 3}), \
+                patch.object(aws_render, "_put_json_once", side_effect=lambda _c, _k, m:
+                             manifests.append(m) or "s3://private-bucket/manifest.json"), \
+                patch.object(aws_render, "_run_task", return_value="task-arn"):
+            aws_render.dispatch_slack_delivery(CONFIG, "job12345", "attempt12345",
+                "/tmp/video.mp4", "C12345678", "A jazzy launch!", "Sprint - Song.mp4")
+        self.assertEqual(manifests[0]["settings"], {
+            "channel_id": "C12345678", "caption": "A jazzy launch!",
+            "filename": "Sprint - Song.mp4"})
+
     def test_manifest_contains_only_prepared_assets_and_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
