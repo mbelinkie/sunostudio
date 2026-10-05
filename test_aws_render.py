@@ -247,12 +247,12 @@ class AWSRenderTests(unittest.TestCase):
             def client(name):
                 if name == "sts":
                     return type("STS", (), {"get_caller_identity": lambda self: {
-                        "Account": "521180198930"}})()
+                        "Account": "123456789012"}})()
                 return object()
 
         saved = {}
         args = type("Args", (), {"profile": "suno-prod", "region": "us-east-1",
-                                  "account": "521180198930", "check": False,
+                                  "account": "123456789012", "check": False,
                                   "no_slack": True})()
         with patch.object(setup_aws, "_aws", return_value=Session()), \
                 patch.object(setup_aws, "_network", return_value=("vpc-1", ["subnet-1"], "sg-1")), \
@@ -269,7 +269,7 @@ class AWSRenderTests(unittest.TestCase):
                 patch.object(setup_aws.time, "sleep"):
             setup_aws.provision(args)
         self.assertEqual(saved["aws_profile"], "suno-prod")
-        self.assertEqual(saved["aws_account_id"], "521180198930")
+        self.assertEqual(saved["aws_account_id"], "123456789012")
 
 
 if __name__ == "__main__":
