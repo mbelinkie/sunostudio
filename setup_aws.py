@@ -8,12 +8,15 @@ without storing AWS access keys. It is safe to rerun after a partial setup.
 
 import argparse
 import base64
+import configparser
 import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import sys
+import tempfile
 import time
 import zipfile
 from getpass import getpass
@@ -23,6 +26,63 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path.home() / ".suno_studio" / "config.json"
 PREFIX = "suno-studio"
+
+
+def migrate_sso_profile(profile, config_path=None):
+    """Associate legacy SSO with a refreshable session; keep account/role intact."""
+    path = Path(config_path or os.environ.get("AWS_CONFIG_FILE") or
+                Path.home() / ".aws/config").expanduser().resolve()
+    if not path.is_file():
+        return False
+    with path.open(newline="") as stream:
+        text = stream.read()
+    config = configparser.RawConfigParser()
+    config.read_string(text)
+    profile = profile or os.environ.get("AWS_PROFILE") or "default"
+    section = "default" if profile == "default" else "profile " + profile
+    if not config.has_section(section) or config.has_option(section, "sso_session"):
+        return False
+    values = dict(config.items(section))
+    if not any(key in values for key in ("sso_start_url", "sso_region")):
+        return False
+    if not all(values.get(key) for key in (
+            "sso_start_url", "sso_region", "sso_account_id", "sso_role_name")):
+        raise ValueError("Incomplete AWS SSO profile; finish AWS sign-in setup first")
+    if any("\n" in values[key] or "\r" in values[key]
+           for key in ("sso_start_url", "sso_region")):
+        raise ValueError("AWS SSO URL and region must each be one line")
+    name = "suno-studio-" + hashlib.sha256(
+        (profile + values["sso_start_url"] + values["sso_region"]).encode()).hexdigest()[:12]
+    base, number = name, 1
+    while config.has_section("sso-session " + name):
+        name = f"{base}-{number}"
+        number += 1
+    # Retain equal inline URL/region for compatibility. The association enables refresh.
+    match = re.search(r"^\[" + re.escape(section) + r"\][^\n]*(?:\n|$).*?(?=^\[|\Z)",
+                      text, re.M | re.S)
+    if not match:
+        raise ValueError("Could not locate AWS profile section")
+    updated = (text[:match.end()] + ("" if text[:match.end()].endswith("\n") else "\n") +
+               f"sso_session = {name}\n" + text[match.end():])
+    updated += (f"\n[sso-session {name}]\nsso_start_url = {values['sso_start_url']}\n"
+                f"sso_region = {values['sso_region']}\n"
+                "sso_registration_scopes = sso:account:access\n")
+    configparser.RawConfigParser().read_string(updated)
+    backup = path.with_name(path.name + f".before-sso-{time.time_ns()}")
+    with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+        stream.write(path.read_bytes())
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", newline="", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
 
 
 def _aws(profile, region):

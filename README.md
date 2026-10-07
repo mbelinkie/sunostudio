@@ -12,13 +12,13 @@ rendering can encode several videos at once.
 ## Download and start
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.6-macOS.zip` for the Mac app, or
-   `SunoStudio-6.0.6-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.7-macOS.zip` for the Mac app, or
+   `SunoStudio-6.0.7-source.zip` for the source and Windows launcher.
 2. Install [Python 3.9 or newer](https://www.python.org/downloads/) and an
    [FFmpeg build](https://ffmpeg.org/download.html) with `subtitles` and
    `drawtext` support. Both `ffmpeg` and `ffprobe` must be available. The
    [setup guide](SETUP.md) has checks for macOS and Windows.
-3. Extract the ZIP. On macOS, move **Suno Studio 6.0.6.app** to Applications
+3. Extract the ZIP. On macOS, move **Suno Studio 6.0.7.app** to Applications
    and double-click it. On Windows, extract the full source ZIP folder
    and double-click **Start Suno Studio.bat** inside it. Keep the launcher
    beside `suno_studio.py`.
@@ -37,7 +37,7 @@ The local app needs no Python packages or cloud account. Gmail, OpenAI, AWS,
 and Slack are optional. See [SETUP.md](SETUP.md) for optional services and
 troubleshooting.
 
-Version 6.0.6 lets a request run through video delivery automatically when
+Version 6.0.7 lets a request run through video delivery automatically when
 **Require approval after video rendering** is off. Song Caption is also
 available in manual creation. AWS task updates made while the app is open are
 used for new jobs instead of being replaced by older saved settings.

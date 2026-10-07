@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "6.0.6"
+VERSION = "6.0.7"
 SOURCE_FILES = (
     "README.md", "SETUP.md", "SECURITY.md", "LICENSE", "lyrics-parsing.md",
     "suno_studio.py", "bug_reports.py", "stable_ts_hybrid.py", "subs_doctor.py",
@@ -19,6 +19,7 @@ SOURCE_FILES = (
     "Start Suno Studio.command", "Start Suno Studio.bat", "Check Subtitles.command",
     "Diagnose Video.command", "Check Video Tools.ps1",
     "Install Local Lyric Alignment.command",
+    "test_aws_sso.py", "test_aws_sso_refresh.py",
 )
 EPOCH = (1980, 1, 1, 0, 0, 0)
 
@@ -90,7 +91,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", args.version):
-        parser.error("version must look like 6.0 or 6.0.6")
+        parser.error("version must look like 6.0 or 6.0.7")
     source_files = _files(args.version)
     source_version = re.search(
         r'^APP_VERSION\s*=\s*["\']([^"\']+)',

@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.6"
+APP_VERSION = "6.0.7"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -997,7 +997,17 @@ def run_aws_setup(action, profile, region, account=""):
             aws = shutil.which("aws") or next((p for p in
                 ("/usr/local/bin/aws", "/opt/homebrew/bin/aws") if Path(p).is_file()), None)
             if not aws:
-                raise RuntimeError("Install AWS CLI v2 to sign in, then try again")
+                raise RuntimeError("Install AWS CLI v2.9 or later to sign in, then try again")
+            version = subprocess.run([aws, "--version"], capture_output=True, text=True,
+                                     timeout=10)
+            match = re.search(r"aws-cli/(\d+)\.(\d+)\.(\d+)",
+                              version.stdout + version.stderr)
+            if version.returncode or not match or tuple(map(int, match.groups())) < (2, 9, 0):
+                raise RuntimeError("Update AWS CLI to v2.9 or later for refreshable SSO sign-in")
+            from setup_aws import migrate_sso_profile
+            if migrate_sso_profile(profile):
+                report("AWS profile backed up and upgraded to refreshable SSO. Sign in once for the new session.")
+            report("AWS renews temporary credentials automatically until your administrator's identity session expires. Then sign in again.")
             cmd = [aws, "sso", "login"] + (["--profile", profile] if profile else [])
         else:
             report("Installing AWS support (first use may take a few minutes)…")
@@ -7121,7 +7131,7 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
     <p class="hint">AWS runs paid parallel video jobs. Profiles and credentials stay on this computer; each person connects their own AWS account. Check the account and region before creating resources there. That checked account pays for the jobs. You can change task size later without rebuilding the worker.</p>
     <div class="row"><div><label for="s_aws_profile">AWS profile</label><input type="text" id="s_aws_profile" list="aws_profiles" oninput="awsAccountChanged()" placeholder="default or named SSO profile"><datalist id="aws_profiles"></datalist></div>
       <div><label for="s_aws_region">AWS region</label><input type="text" id="s_aws_region" oninput="awsAccountChanged()" placeholder="us-east-1"></div></div>
-    <div class="hint">Profile sign-in requires <a href="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" target="_blank" rel="noreferrer">AWS CLI v2</a>. If you have no profile yet, follow the <a href="https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html" target="_blank" rel="noreferrer">AWS sign-in setup</a> once. No access keys are stored in Suno Studio.</div>
+    <div class="hint">Sign in upgrades legacy SSO profiles after a backup. Temporary credentials renew automatically until your administrator’s identity session expires; then sign in again. Profile sign-in requires <a href="https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" target="_blank" rel="noreferrer">AWS CLI v2.9 or later</a>. If you have no profile yet, follow the <a href="https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html" target="_blank" rel="noreferrer">AWS sign-in setup</a> once. No access keys are stored in Suno Studio.</div>
     <div class="btns" style="margin-top:12px"><button type="button" class="ghost small" onclick="awsStep('signin')">Sign in</button>
       <button type="button" class="ghost small" onclick="awsStep('check')">Check account</button>
       <button type="button" class="small" id="s_aws_setup" onclick="awsStep('setup')" disabled>Create AWS resources</button></div>
@@ -7610,7 +7620,7 @@ async function refresh(){
     const paused = ['paused_song','paused_image','paused_video'].includes(j.status);
     const badge = run ? '<span class="badge b-run">working</span>'
       : paused ? '<span class="badge b-new">approval needed</span>'
-      : (j.status==='done'||j.status==='completed') ? '<span class="badge b-done">done</span>'
+      : (j.status==='done'||j.status==='completed') ? `<span class="badge b-done">${j.delivery_status==='sent' ? (j.delivery_mode==='slack' ? 'Done - Slack Delivery' : 'Done - Email Delivery') : j.delivery_status==='error' ? 'Done - Delivery Failed' : j.delivery_status==='needs_review' ? 'Done - Delivery Needs Review' : j.delivery_mode && j.delivery_mode!=='none' ? 'Done - Delivery Pending' : 'Done - No Delivery'}</span>`
       : j.status==='cancelled' ? '<span class="badge b-err">cancelled</span>'
       : '<span class="badge b-err">failed</span>';
     const songSource = j.pipeline ? (j.song_variants||[]).map(v=>v.track).filter(Boolean)

@@ -38,8 +38,8 @@ retry does not regenerate the song or video.
 
 ## Release downloads
 
-Download `SunoStudio-6.0.6-macOS.zip` or
-`SunoStudio-6.0.6-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.7-macOS.zip` or
+`SunoStudio-6.0.7-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -52,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.6-macOS.zip` for the Mac app or
-   `SunoStudio-6.0.6-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.7-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.7-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -62,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.6.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.7.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.
@@ -143,7 +143,7 @@ for email, it opens the message. An empty caption keeps the usual text.
 ## AWS Fargate setup, cost, retention, and cleanup
 
 Cloud rendering is optional and billed to your AWS account. Install [AWS CLI
-v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+v2.9 or later](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
 and create an [AWS IAM Identity Center (SSO)
 profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html)
 with permission to provision the resources below. AWS account administrators
@@ -166,6 +166,19 @@ rerun setup later after adding a token. The app does not store AWS access
 keys. The private AWS library lives under `~/.suno_studio/` (or
 `%USERPROFILE%\.suno_studio\` on Windows), so the standalone macOS app can
 use it after a restart.
+
+**SSO sign-in persistence:** Sign in backs up a legacy inline SSO profile to
+`config.before-sso-<timestamp>` beside the AWS config, then associates it with a
+refreshable `sso-session`. The account, role, and unrelated profiles stay intact.
+The first sign-in after migration creates a new session cache; the old cache is
+left alone. Existing modern profiles are unchanged. `AWS_CONFIG_FILE` is honored.
+
+The SDK renews SSO access tokens and temporary role credentials automatically
+when needed, including during long-running uploads. Renewal stops when the
+administrator-configured IAM Identity Center session expires or is revoked;
+click **Sign in** again then. This does not provide indefinite login or change
+your permissions or the account's session-duration policy. That policy has not
+been inspected. See [AWS's refreshable SSO guidance](https://docs.aws.amazon.com/sdkref/latest/guide/feature-sso-credentials.html).
 
 For troubleshooting, the command-line setup remains available from the source
 download:
