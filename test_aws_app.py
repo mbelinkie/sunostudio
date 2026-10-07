@@ -193,6 +193,134 @@ class AwsAppTests(unittest.TestCase):
         download.assert_called_once()
         self.assertEqual(updates[-1]["cloud_execution"]["status"], "succeeded")
 
+    def test_prelaunch_aws_failure_retries_same_pipeline_attempt(self):
+        with TemporaryDirectory() as root:
+            audio, image, output = (Path(root) / name for name in
+                                    ("song.mp3", "chosen.png", "video.mp4"))
+            audio.write_bytes(b"audio")
+            image.write_bytes(b"art")
+            job = {"id": "job12345", "pipeline": True, "status": "error", "stage": "video",
+                   "song_variants": [{"id": "song-a", "file": str(audio),
+                                      "track": {"file": str(audio)}}],
+                   "selected_song": "song-a",
+                   "image_variants": [{"id": "image-a", "file": str(image)}],
+                   "selected_image": "image-a"}
+            dispatched_attempts = []
+
+            def set_job(_job_id, **changes):
+                job.update(changes)
+
+            def dispatch(_config, job_id, attempt, _assets, _settings, on_dispatch=None):
+                dispatched_attempts.append(attempt)
+                if len(dispatched_attempts) == 1:
+                    raise PermissionError("expired AWS credentials during upload")
+                on_dispatch()
+                return {"mode": "render", "job_id": job_id, "attempt_id": attempt,
+                        "task_arn": "arn:task", "result_uri": "s3://bucket/result.json",
+                        "output_uri": "s3://bucket/video.mp4", "status": "running"}
+
+            successful = {"status": "succeeded", "result": {"status": "succeeded"}}
+
+            class ImmediateThread:
+                def __init__(self, target, args=(), kwargs=None, daemon=None):
+                    self.target, self.args, self.kwargs = target, args, kwargs or {}
+
+                def start(self):
+                    self.target(*self.args, **self.kwargs)
+
+            def retry_worker(job_id, track, recovering=False):
+                self.assertEqual(track["file"], str(audio))
+                self.assertEqual(track["pipeline_image"], str(image))
+                app.render_video_aws(job_id, {"audio": audio, "background": image},
+                                     {"height": 720}, output)
+
+            with mock.patch.object(app, "aws_settings", return_value={"bucket": "bucket"}), \
+                    mock.patch.object(app, "job_snapshot", return_value=job), \
+                    mock.patch.object(app, "set_job", side_effect=set_job), \
+                    mock.patch.object(app, "load_jobs",
+                                      side_effect=lambda: ({job["id"]: job}, {})), \
+                    mock.patch("aws_render._config"), \
+                    mock.patch("aws_render.reconcile_render",
+                               side_effect=lambda _config, state: state) as reconcile, \
+                    mock.patch("aws_render.dispatch_render", side_effect=dispatch), \
+                    mock.patch("aws_render.wait_or_poll_render", return_value=successful) as poll, \
+                    mock.patch("aws_render.download_verified"), \
+                    mock.patch.object(app, "run_video_job", side_effect=retry_worker), \
+                    mock.patch.object(app.threading, "Thread", ImmediateThread), \
+                    mock.patch.object(app, "make_provider") as provider:
+                with self.assertRaisesRegex(PermissionError, "expired AWS credentials"):
+                    app.render_video_aws("job12345", {"audio": audio, "background": image},
+                                         {"height": 720}, output)
+
+                saved_attempt = job["cloud_execution"]
+                self.assertEqual(saved_attempt["status"], "preparing")
+                self.assertNotIn("task_arn", saved_attempt)
+                app.pipeline_action("job12345", "retry_video")
+
+            self.assertEqual(dispatched_attempts, [saved_attempt["attempt_id"]] * 2)
+            self.assertEqual(job["cloud_execution"]["status"], "succeeded")
+            self.assertEqual(poll.call_count, 1)
+            reconcile.assert_not_called()
+            provider.assert_not_called()
+
+    def test_retry_video_keeps_unconfirmed_dispatch_blocked(self):
+        attempt = {"attempt_id": "attempt12345", "status": "dispatching",
+                   "result_uri": "s3://bucket/result.json"}
+        job = {"id": "job12345", "pipeline": True, "status": "error", "stage": "video",
+               "cloud_execution": attempt}
+        with mock.patch.object(app, "job_snapshot", return_value=job), \
+                mock.patch.object(app, "aws_settings", return_value={}), \
+                mock.patch("aws_render.wait_or_poll_render", return_value={
+                    **attempt, "status": "running"}), \
+                mock.patch("aws_render.reconcile_render", return_value=attempt), \
+                mock.patch.object(app, "start_pipeline_video") as start:
+            with self.assertRaisesRegex(RuntimeError, "AWS attempt is unconfirmed"):
+                app.pipeline_action("job12345", "retry_video")
+        start.assert_not_called()
+
+    def test_preparing_attempt_with_task_arn_recovers_existing_task(self):
+        attempt = {"attempt_id": "attempt12345", "status": "preparing",
+                   "task_arn": "arn:task", "result_uri": "s3://bucket/result.json"}
+        job = {"id": "job12345", "pipeline": True, "status": "error", "stage": "video",
+               "cloud_execution": attempt,
+               "song_variants": [{"id": "song-a", "file": "/tmp/song.mp3"}],
+               "selected_song": "song-a",
+               "image_variants": [{"id": "image-a", "file": "/tmp/image.png"}],
+               "selected_image": "image-a"}
+        with mock.patch.object(app, "job_snapshot", return_value=job), \
+                mock.patch.object(app, "aws_settings", return_value={}), \
+                mock.patch("aws_render.wait_or_poll_render", return_value={
+                    **attempt, "status": "running"}), \
+                mock.patch("aws_render.reconcile_render") as reconcile, \
+                mock.patch.object(app, "set_job"), \
+                mock.patch.object(app.threading, "Thread") as thread, \
+                mock.patch.object(app, "start_pipeline_video") as start:
+            app.pipeline_action("job12345", "retry_video")
+        reconcile.assert_not_called()
+        start.assert_not_called()
+        self.assertTrue(thread.call_args.kwargs["args"][2])
+
+    def test_render_does_not_start_task_when_dispatch_journal_is_not_durable(self):
+        with TemporaryDirectory() as root:
+            audio, image = Path(root) / "song.mp3", Path(root) / "art.png"
+            audio.write_bytes(b"audio")
+            image.write_bytes(b"art")
+            job = {"id": "job12345", "created": 1}
+            with mock.patch.object(app, "JOBS", {"job12345": job}), \
+                    mock.patch.object(app, "JOBS_PATH", Path(root) / "jobs.json"), \
+                    mock.patch.object(app, "aws_settings", return_value={"bucket": "bucket"}), \
+                    mock.patch.object(app, "atomic_write_json", side_effect=OSError("disk full")), \
+                    mock.patch("aws_render._config", side_effect=lambda config: config), \
+                    mock.patch("aws_render._upload_file", return_value={"uri": "s3://bucket/asset"}), \
+                    mock.patch("aws_render._put_json_once", return_value="s3://bucket/manifest.json"), \
+                    mock.patch("aws_render._run_task") as run_task:
+                with self.assertRaisesRegex(RuntimeError, "journal could not be saved"):
+                    app.render_video_aws("job12345", {"audio": audio, "background": image},
+                                         {}, Path(root) / "out.mp4")
+                self.assertNotIn("job12345", app.load_jobs()[0])
+                self.assertEqual(job["cloud_execution"]["status"], "preparing")
+            run_task.assert_not_called()
+
     def test_bug_report_sends_only_preview_allowlist(self):
         with mock.patch("bug_reports.send_report", return_value="event123") as sent:
             result = test_app_reliability.post_json("/api/bug/submit", {

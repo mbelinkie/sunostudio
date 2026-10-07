@@ -50,7 +50,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP_VERSION = "6.0.7"
+APP_VERSION = "6.0.8"
 
 PORT = 8765
 HOST = "127.0.0.1"
@@ -814,6 +814,451 @@ def pipeline_root(kind):
     return final_root().parent / ("Suno Studio Staging" if kind == "staging" else "Suno Studio Rejects")
 
 
+_PURGE_DONE_STATES = {"cancelled", "completed", "done", "succeeded"}
+_PURGE_PENDING_DELIVERY = {"queued", "sending", "awaiting_approval", "needs_review", "error"}
+_PURGE_AUDIO_EXTS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
+_PURGE_IMAGE_EXTS = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_PURGE_AUDIO_ART_EXTS = _PURGE_AUDIO_EXTS | _PURGE_IMAGE_EXTS
+_PURGE_VIDEO_EXTS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+
+
+def save_video_purge_reference(job_id, video_path):
+    """Remember the exact published video after its job card is cleared."""
+    if not re.fullmatch(r"[0-9a-f]{32}", str(job_id or "")):
+        return
+    output = final_root()
+    namespace = output / ".suno-studio-media"
+    archive = namespace / job_id
+    try:
+        if output.is_symlink() or namespace.is_symlink() or archive.is_symlink():
+            return
+        archive.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(archive / ".video.json", {"final_path": str(video_path)})
+    except Exception as error:
+        # Publishing already succeeded. A failed local cleanup hint must not
+        # turn a completed render into a failed job.
+        print(f"[pipeline] could not save media purge reference: {error}")
+
+
+def _purge_root(path):
+    """Resolve an existing application root, rejecting a symlink root."""
+    path = Path(os.path.expanduser(str(path)))
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return None
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _purge_contained(path, root, want_dir=None):
+    """Return a resolved path only when it is strictly beneath an allowed root."""
+    path = Path(os.path.expanduser(str(path)))
+    try:
+        if path.is_symlink():
+            return None
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        if resolved == root:
+            return None
+        if want_dir is True and not resolved.is_dir():
+            return None
+        if want_dir is False and not resolved.is_file():
+            return None
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _purge_tree_snapshot(path):
+    """List regular files without following symlinks inside an owned folder."""
+    entries = []
+    totals = {"files": 0, "bytes": 0, "videos": 0, "audio_artwork": 0}
+
+    def record(candidate, kind, size=0, mtime_ns=0):
+        entries.append((str(candidate.relative_to(path)), kind, size, mtime_ns))
+
+    def onerror(_error):
+        entries.append(("<unreadable>", "error", 0, 0))
+
+    try:
+        for directory, names, filenames in os.walk(path, topdown=True,
+                                                    followlinks=False,
+                                                    onerror=onerror):
+            current = Path(directory)
+            try:
+                stat_result = current.stat()
+                record(current, "dir", 0, stat_result.st_mtime_ns)
+            except OSError:
+                record(current, "error")
+            for name in list(names):
+                child = current / name
+                try:
+                    if child.is_symlink():
+                        stat_result = child.lstat()
+                        record(child, "symlink", stat_result.st_size,
+                               stat_result.st_mtime_ns)
+                        names.remove(name)
+                except OSError:
+                    names.remove(name)
+                    record(child, "error")
+            for name in filenames:
+                child = current / name
+                try:
+                    if child.is_symlink():
+                        stat_result = child.lstat()
+                        record(child, "symlink", stat_result.st_size,
+                               stat_result.st_mtime_ns)
+                        continue
+                    stat_result = child.stat()
+                    if not child.is_file():
+                        record(child, "other", stat_result.st_size,
+                               stat_result.st_mtime_ns)
+                        continue
+                    size = stat_result.st_size
+                    record(child, "file", size, stat_result.st_mtime_ns)
+                    totals["files"] += 1
+                    totals["bytes"] += size
+                    suffix = child.suffix.lower()
+                    totals["videos"] += suffix in _PURGE_VIDEO_EXTS
+                    totals["audio_artwork"] += suffix in _PURGE_AUDIO_ART_EXTS
+                except OSError:
+                    record(child, "error")
+    except OSError:
+        record(path, "error")
+    return entries, totals
+
+
+def _media_purge_plan_locked():
+    """Build a stable preview and deletion plan while JOBS_LOCK is held."""
+    jobs = sorted(((str(job_id), job) for job_id, job in JOBS.items()
+                   if isinstance(job, dict)), key=lambda pair: pair[0])
+    terminal = {}
+    blocked = False
+    reason = ""
+    for job_id, job in jobs:
+        status = str(job.get("status") or "").lower()
+        delivery = str(job.get("delivery_status") or "").lower()
+        if status not in _PURGE_DONE_STATES:
+            blocked = True
+            reason = "Finish or remove all unfinished jobs before purging saved media."
+            break
+        if delivery in _PURGE_PENDING_DELIVERY:
+            blocked = True
+            reason = "Finish or review pending deliveries before purging saved media."
+            break
+        terminal[job_id] = job
+
+    roots = {}
+    for key, path in (("output", final_root()), ("video", final_video_root()),
+                      ("staging", pipeline_root("staging")),
+                      ("rejects", pipeline_root("rejects"))):
+        resolved = _purge_root(path)
+        if resolved is not None:
+            roots[key] = resolved
+    allowed_roots = list(dict.fromkeys(roots.values()))
+    targets = {}
+    skipped_refs = set()
+    unresolved_jobs = set()
+    unresolved_refs = set()
+
+    def note_skipped(value, owner=None):
+        skipped_refs.add(str(value))
+        if owner:
+            unresolved_jobs.add(owner)
+            unresolved_refs.add((owner, str(value)))
+
+    def add_directory(candidate, root, kind, owner=None):
+        safe = _purge_contained(candidate, root, want_dir=True)
+        if safe is None:
+            if os.path.lexists(candidate):
+                note_skipped(candidate, owner)
+            return None
+        key = str(safe)
+        target = targets.setdefault(key, {"path": safe, "root": root,
+                                           "kind": kind, "owners": set()})
+        if owner:
+            target["owners"].add(owner)
+        # A later reason may be more specific for the UI statistics.
+        if kind == "reject":
+            target["kind"] = "reject"
+        return key
+
+    def add_file(candidate, owner=None, allowed_exts=None):
+        try:
+            candidate = Path(os.path.expanduser(str(candidate)))
+        except (TypeError, ValueError):
+            note_skipped(candidate, owner)
+            return None
+        if allowed_exts and candidate.suffix.lower() not in allowed_exts:
+            if os.path.lexists(candidate):
+                note_skipped(candidate, owner)
+            else:
+                skipped_refs.add(str(candidate))
+            return None
+        safe = None
+        for root in allowed_roots:
+            safe = _purge_contained(candidate, root, want_dir=False)
+            if safe is not None:
+                break
+        if safe is None:
+            if os.path.lexists(candidate):
+                note_skipped(candidate, owner)
+            else:
+                # A stale path to a file already gone cannot lead the purge
+                # outside its roots; keep it visible in the skipped count but
+                # do not strand an otherwise empty completed job card.
+                skipped_refs.add(str(candidate))
+            return None
+        # A containing job directory already owns this file, so the exact
+        # file path must not become a second deletion target or count twice.
+        for key, target in targets.items():
+            if target["kind"] != "file":
+                try:
+                    safe.relative_to(target["path"])
+                    if owner:
+                        target["owners"].add(owner)
+                    return key
+                except ValueError:
+                    pass
+        key = str(safe)
+        target = targets.setdefault(key, {"path": safe, "root": safe.parent,
+                                           "kind": "file", "owners": set()})
+        if owner:
+            target["owners"].add(owner)
+        return key
+
+    # Exact job-owned stage folders and managed generated-ID orphan folders.
+    staging_root = roots.get("staging")
+    if staging_root:
+        for job_id in terminal:
+            add_directory(staging_root / job_id, staging_root, "staging", job_id)
+        try:
+            for child in sorted(staging_root.iterdir()):
+                if (re.fullmatch(r"[0-9a-f]{32}", child.name) and
+                        child.is_dir() and not child.is_symlink()):
+                    add_directory(child, staging_root, "staging",
+                                  child.name if child.name in terminal else None)
+        except OSError:
+            pass
+
+    # This hidden namespace is reserved for archived Suno Studio previews.
+    output_root = roots.get("output")
+    archive_root = (_purge_contained(output_root / ".suno-studio-media", output_root,
+                                     want_dir=True) if output_root else None)
+    if archive_root:
+        try:
+            for child in sorted(archive_root.iterdir()):
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                owner = child.name if child.name in terminal else None
+                key = add_directory(child, archive_root, "archive", owner)
+                if not key:
+                    continue
+                manifest = child / ".video.json"
+                safe_manifest = _purge_contained(manifest, archive_root, want_dir=False)
+                if safe_manifest is None:
+                    continue
+                try:
+                    metadata = json.loads(safe_manifest.read_text(encoding="utf-8"))
+                    reference = metadata.get("final_path") if isinstance(metadata, dict) else ""
+                    if reference:
+                        add_file(reference, owner, _PURGE_VIDEO_EXTS)
+                except (OSError, ValueError, TypeError):
+                    note_skipped(manifest, owner)
+        except OSError:
+            pass
+
+    # Dated Rejects are app-managed; do not delete a whole configured root.
+    rejects_root = roots.get("rejects")
+    if rejects_root:
+        try:
+            for date_dir in sorted(rejects_root.iterdir()):
+                if (date_dir.is_symlink() or not date_dir.is_dir() or
+                        not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_dir.name)):
+                    continue
+                try:
+                    datetime.strptime(date_dir.name, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                for child in sorted(date_dir.iterdir()):
+                    if child.is_dir() and not child.is_symlink():
+                        add_directory(child, rejects_root, "reject",
+                                      child.name if child.name in terminal else None)
+        except OSError:
+            pass
+
+    # Job records are the source of truth for exact MP3, artwork, and final MP4
+    # paths. Never search by basename or infer a path from a title.
+    for job_id, job in terminal.items():
+        refs = []
+        for variant in job.get("song_variants") or []:
+            if not isinstance(variant, dict):
+                continue
+            refs.append((variant.get("file"), _PURGE_AUDIO_EXTS))
+            track = variant.get("track") or {}
+            if isinstance(track, dict):
+                refs.append((track.get("file"), _PURGE_AUDIO_EXTS))
+        for variant in job.get("image_variants") or []:
+            if isinstance(variant, dict):
+                refs.append((variant.get("file"), _PURGE_IMAGE_EXTS))
+        for track in job.get("tracks") or []:
+            if isinstance(track, dict):
+                refs.append((track.get("file"),
+                             _PURGE_VIDEO_EXTS if track.get("video") else
+                             _PURGE_AUDIO_EXTS))
+        refs.extend(((job.get("final_path"), _PURGE_VIDEO_EXTS),
+                     (job.get("output_path"), _PURGE_VIDEO_EXTS),
+                     (job.get("video_image_file"), _PURGE_IMAGE_EXTS)))
+        for reference, extensions in refs:
+            if reference:
+                add_file(reference, job_id, extensions)
+
+    # Count old untracked MP4s as skipped. They are deliberately not deleted:
+    # without a job card or archive manifest, their ownership is ambiguous.
+    owned_files = {key for key, value in targets.items() if value["kind"] == "file"}
+    covered_dirs = [value["path"] for value in targets.values()
+                    if value["kind"] != "file"]
+    for root in allowed_roots:
+        if root not in {roots.get("output"), roots.get("video")}:
+            continue
+        try:
+            for directory, names, filenames in os.walk(root, followlinks=False):
+                current = Path(directory)
+                names[:] = [name for name in names if not (current / name).is_symlink()]
+                for name in filenames:
+                    candidate = current / name
+                    if candidate.suffix.lower() not in _PURGE_VIDEO_EXTS or candidate.is_symlink():
+                        continue
+                    try:
+                        resolved = candidate.resolve(strict=True)
+                    except OSError:
+                        continue
+                    if str(resolved) in owned_files:
+                        continue
+                    if any(resolved == folder or folder in resolved.parents
+                           for folder in covered_dirs):
+                        continue
+                    skipped_refs.add(str(resolved))
+        except OSError:
+            pass
+
+    count = {"files": 0, "bytes": 0, "videos": 0, "audio_artwork": 0,
+             "rejects": 0}
+    snapshot_entries = []
+    for key, target in sorted(targets.items()):
+        path = target["path"]
+        if target["kind"] == "file":
+            try:
+                stat_result = path.stat()
+                suffix = path.suffix.lower()
+                count["files"] += 1
+                count["bytes"] += stat_result.st_size
+                count["videos"] += suffix in _PURGE_VIDEO_EXTS
+                count["audio_artwork"] += suffix in _PURGE_AUDIO_ART_EXTS
+                snapshot_entries.append((key, "file", stat_result.st_size,
+                                         stat_result.st_mtime_ns))
+            except OSError:
+                snapshot_entries.append((key, "missing", 0, 0))
+                note_skipped(path, next(iter(target["owners"]), None))
+            continue
+        tree_entries, totals = _purge_tree_snapshot(path)
+        count["files"] += totals["files"]
+        count["bytes"] += totals["bytes"]
+        count["videos"] += totals["videos"]
+        count["audio_artwork"] += totals["audio_artwork"]
+        if target["kind"] == "reject":
+            count["rejects"] += totals["files"]
+        snapshot_entries.extend((key, entry) for entry in tree_entries)
+
+    job_targets = {job_id: [] for job_id in terminal}
+    for key, target in targets.items():
+        for owner in target["owners"]:
+            if owner in job_targets:
+                job_targets[owner].append(key)
+    removable_jobs = sum(job_id not in unresolved_jobs for job_id in terminal)
+    state_snapshot = [(job_id, job.get("status"), job.get("delivery_status"),
+                       job.get("final_path")) for job_id, job in jobs]
+    digest_data = json.dumps({
+        "jobs": state_snapshot,
+        "targets": snapshot_entries,
+        "job_targets": sorted((job_id, sorted(keys))
+                               for job_id, keys in job_targets.items()),
+        "unresolved_jobs": sorted(unresolved_jobs),
+        "unresolved_refs": sorted(unresolved_refs),
+        "removable_jobs": removable_jobs,
+        "skipped": sorted(skipped_refs),
+        "blocked": blocked,
+        "reason": reason,
+    }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    public = {
+        **count,
+        "jobs": removable_jobs,
+        "blocked": blocked,
+        "reason": reason,
+        "snapshot": hashlib.sha256(digest_data).hexdigest(),
+        "skipped": len(skipped_refs),
+    }
+    return {"public": public, "targets": targets, "job_targets": job_targets,
+            "unresolved_jobs": unresolved_jobs, "terminal": terminal}
+
+
+def media_purge_preview():
+    with JOBS_LOCK:
+        return dict(_media_purge_plan_locked()["public"])
+
+
+def media_purge_confirm(body):
+    if not isinstance(body, dict) or body.get("confirmed") is not True:
+        return {"ok": False, "error": "Explicit confirmation is required."}, 400
+    expected = body.get("snapshot")
+    if not isinstance(expected, str) or not expected:
+        return {"ok": False, "error": "Preview the saved media before confirming."}, 400
+
+    with JOBS_LOCK:
+        plan = _media_purge_plan_locked()
+        public = plan["public"]
+        if public["blocked"]:
+            return {"ok": False, "error": public["reason"], **public}, 409
+        if expected != public["snapshot"]:
+            return {"ok": False, "error": "Saved media changed; review a fresh preview."}, 409
+
+        errors = []
+        for target in plan["targets"].values():
+            path, root = target["path"], target["root"]
+            try:
+                if target["kind"] == "file":
+                    safe = _purge_contained(path, root, want_dir=False)
+                    if safe is not None:
+                        safe.unlink()
+                else:
+                    safe = _purge_contained(path, root, want_dir=True)
+                    if safe is not None:
+                        shutil.rmtree(safe)
+            except OSError as error:
+                errors.append((path, str(error)))
+
+        removed_jobs = 0
+        failed_paths = {str(path) for path, _error in errors}
+        for job_id in plan["terminal"]:
+            owned = plan["job_targets"].get(job_id) or []
+            if (job_id in plan["unresolved_jobs"] or
+                    any(path in failed_paths or os.path.lexists(path) for path in owned)):
+                continue
+            JOBS.pop(job_id, None)
+            JOB_FORMS.pop(job_id, None)
+            removed_jobs += 1
+        if removed_jobs:
+            _save_jobs_locked()
+
+    if errors:
+        return {"ok": False, "error": "Some saved media could not be removed.",
+                "files": public["files"], "bytes": public["bytes"],
+                "jobs": removed_jobs, "skipped": public["skipped"]}, 500
+    return {"ok": True, "files": public["files"], "bytes": public["bytes"],
+            "jobs": removed_jobs, "skipped": public["skipped"]}, 200
+
+
 def reject_path(job_id, artifact, reason="rejected"):
     src = Path(artifact)
     if not src.exists():
@@ -1485,6 +1930,46 @@ def cancel_and_remove_job(job_id):
     return rejected
 
 
+def archive_pipeline_media(job_id, job):
+    """Copy every song and image choice to Final before staging is removed."""
+    archive = (final_root() / ".suno-studio-media" / job_id).resolve()
+    copied = {}
+
+    def keep(path, name):
+        source = Path(path)
+        if not source.is_file():
+            raise RuntimeError(f"completed preview media is missing: {source.name}")
+        source_key = source.resolve()
+        if source_key in copied:
+            return copied[source_key]
+        target = archive / f"{name}{source.suffix}"
+        if source_key != target.resolve():
+            archive.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        copied[source_key] = str(target)
+        return copied[source_key]
+
+    songs = []
+    for index, source_variant in enumerate(job.get("song_variants") or [], 1):
+        variant = dict(source_variant)
+        if variant.get("file"):
+            variant["file"] = keep(variant["file"], f"song-{index:02d}")
+        track = dict(variant.get("track") or {})
+        if track.get("file"):
+            track["file"] = keep(track["file"], f"song-{index:02d}-track")
+        if variant.get("track") is not None:
+            variant["track"] = track
+        songs.append(variant)
+
+    images = []
+    for index, source_variant in enumerate(job.get("image_variants") or [], 1):
+        variant = dict(source_variant)
+        if variant.get("file"):
+            variant["file"] = keep(variant["file"], f"image-{index:02d}")
+        images.append(variant)
+    return songs, images
+
+
 def finalize_pipeline_job(job_id):
     job = job_snapshot(job_id)
     video = job.get("video_path") or job.get("output_path")
@@ -1493,14 +1978,24 @@ def finalize_pipeline_job(job_id):
     fields = normalize_delivery_fields(job.get("current_fields") or JOB_FORMS.get(job_id) or {})
     delivery_mode, delivery_destination, delivery_error = delivery_details(fields)
     recipient = delivery_destination if delivery_mode == "email" and not delivery_error else ""
+    songs, images = archive_pipeline_media(job_id, job)
+    image_id = job.get("video_image_id") or job.get("selected_image")
+    video_image_file = next((variant.get("file") for variant in images
+                             if variant.get("id") == image_id and variant.get("file")), "")
+    set_job(job_id, song_variants=songs, image_variants=images,
+            video_image_file=video_image_file)
+    persisted = load_jobs()[0].get(job_id) or {}
+    if ([v.get("file") for v in persisted.get("song_variants", [])] !=
+            [v.get("file") for v in songs] or
+            [((v.get("track") or {}).get("file")) for v in persisted.get("song_variants", [])] !=
+            [((v.get("track") or {}).get("file")) for v in songs] or
+            [v.get("file") for v in persisted.get("image_variants", [])] !=
+            [v.get("file") for v in images] or
+            (video_image_file and
+             persisted.get("video_image_file") != video_image_file)):
+        raise RuntimeError("could not save completed preview media before staging cleanup")
     published = move_to_final(video, job_id, recipient)
-    # Unselected choices remain recoverable; selected intermediate work is
-    # ordinary successful staging and is removed with the job folder.
-    for key, selected_key in (("song_variants", "selected_song"),
-                              ("image_variants", "selected_image")):
-        for variant in job.get(key, []):
-            if variant.get("id") != job.get(selected_key) and variant.get("file"):
-                reject_path(job_id, variant["file"], "unselected")
+    save_video_purge_reference(job_id, published)
     root = Path(job.get("staging_folder") or "")
     if root.is_dir():
         try:
@@ -1638,7 +2133,7 @@ def add_uploaded_image(job_id, filename, data):
             stage="image", message="uploaded image ready for approval")
 
 
-def start_pipeline_video(job_id):
+def start_pipeline_video(job_id, reuse_preparation=False):
     job = job_snapshot(job_id)
     song = selected_variant(job, "song_variants", "selected_song")
     image = selected_variant(job, "image_variants", "selected_image")
@@ -1655,9 +2150,14 @@ def start_pipeline_video(job_id):
     track["pipeline_image"] = str(image_file)
     # Snapshot the exact visible selections onto this same pipeline job.  The
     # renderer must never substitute freshly generated art for a gated image.
-    set_job(job_id, status="queued", stage="video", message="queued for video rendering",
-            video_song_id=song.get("id"), video_image_id=image.get("id"),
-            video_image_file=str(image_file), cloud_execution=None)
+    changes = {"status": "queued", "stage": "video", "message": "queued for video rendering",
+               "video_song_id": song.get("id"), "video_image_id": image.get("id"),
+               "video_image_file": str(image_file)}
+    execution = job.get("cloud_execution") or {}
+    if not (reuse_preparation and execution.get("status") == "preparing" and
+            not execution.get("task_arn") and not execution.get("result")):
+        changes["cloud_execution"] = None
+    set_job(job_id, **changes)
     threading.Thread(target=run_video_job, args=(job_id, track), daemon=True).start()
 
 
@@ -1730,23 +2230,27 @@ def pipeline_action(job_id, action, fields=None, selected=None, prompt=None):
             raise RuntimeError("video retry is available after a failed video stage")
         JOB_CANCELS[job_id] = threading.Event()
         execution = job.get("cloud_execution")
+        reuse_preparation = bool(execution and execution.get("status") == "preparing" and
+                                 not execution.get("task_arn") and not execution.get("result"))
         if execution:
             import aws_render
-            state = aws_render.wait_or_poll_render(aws_settings(), execution, wait_seconds=0)
-            if state["status"] in ("running", "dispatching") and not state.get("task_arn"):
-                state = aws_render.reconcile_render(aws_settings(), state)
-            if state["status"] in ("running", "dispatching") and not state.get("task_arn") and not state.get("result"):
-                raise RuntimeError("AWS attempt is unconfirmed; inspect ECS before starting another paid render")
-            if state["status"] in ("running", "succeeded"):
-                song = selected_variant(job, "song_variants", "selected_song")
-                image = selected_variant(job, "image_variants", "selected_image")
-                track = dict(song.get("track") or {}) if song else {}
-                track["file"] = song.get("file") if song else ""
-                track["pipeline_image"] = image.get("file") if image else ""
-                set_job(job_id, cloud_execution=state, status="queued", stage="video")
-                threading.Thread(target=run_video_job, args=(job_id, track, True), daemon=True).start()
-                return
-        start_pipeline_video(job_id)
+            if not reuse_preparation:
+                state = aws_render.wait_or_poll_render(aws_settings(), execution, wait_seconds=0)
+                if state["status"] in ("running", "dispatching") and not state.get("task_arn"):
+                    state = aws_render.reconcile_render(aws_settings(), state)
+                if (state["status"] in ("running", "dispatching") and
+                        not state.get("task_arn") and not state.get("result")):
+                    raise RuntimeError("AWS attempt is unconfirmed; inspect ECS before starting another paid render")
+                if state["status"] in ("running", "succeeded"):
+                    song = selected_variant(job, "song_variants", "selected_song")
+                    image = selected_variant(job, "image_variants", "selected_image")
+                    track = dict(song.get("track") or {}) if song else {}
+                    track["file"] = song.get("file") if song else ""
+                    track["pipeline_image"] = image.get("file") if image else ""
+                    set_job(job_id, cloud_execution=state, status="queued", stage="video")
+                    threading.Thread(target=run_video_job, args=(job_id, track, True), daemon=True).start()
+                    return
+        start_pipeline_video(job_id, reuse_preparation=reuse_preparation)
     elif action == "rerender_subtitles":
         start_subtitle_rerender(job_id)
     elif action == "approve_video":
@@ -4768,14 +5272,17 @@ def render_video_aws(job_id, assets, settings, destination, journal_key="cloud_e
     job = job_snapshot(job_id)
     execution = job.get(journal_key)
     fresh_attempt = not execution
+    preparing = bool(execution and execution.get("status") == "preparing" and
+                     not execution.get("task_arn") and not execution.get("result"))
     if not execution:
         attempt = uuid.uuid4().hex
         execution = {
-            "job_id": job_id, "attempt_id": attempt, "status": "dispatching",
+            "job_id": job_id, "attempt_id": attempt, "status": "preparing",
             "result_uri": f"s3://{config['bucket']}/render-results/{job_id}/{attempt}/result.json",
         }
+        preparing = True
         set_job(job_id, **{journal_key: execution})
-    else:
+    elif not preparing:
         state = aws_render.wait_or_poll_render(config, execution, wait_seconds=0)
         if state["status"] == "succeeded":
             aws_render.download_verified(config, state, destination)
@@ -4784,19 +5291,34 @@ def render_video_aws(job_id, assets, settings, destination, journal_key="cloud_e
         if state["status"] != "running":
             raise RuntimeError((state.get("result") or {}).get("error") or
                                "AWS render attempt failed; start an explicit new attempt")
-    if not execution.get("task_arn"):
-        execution = aws_render.reconcile_render(config, execution)
-        if not execution.get("task_arn") and not execution.get("result"):
-            if not fresh_attempt:
+    if not execution.get("task_arn") and not execution.get("result"):
+        if not preparing:
+            execution = aws_render.reconcile_render(config, execution)
+            if not execution.get("task_arn") and not execution.get("result") and not fresh_attempt:
                 raise RuntimeError("AWS dispatch is unconfirmed; inspect the saved attempt before retrying")
+        if not execution.get("task_arn") and not execution.get("result"):
+            def mark_dispatching():
+                nonlocal execution
+                dispatching = {**execution, "status": "dispatching"}
+                set_job(job_id, **{journal_key: dispatching})
+                persisted = load_jobs()[0].get(job_id, {}).get(journal_key) or {}
+                if (persisted.get("attempt_id") != dispatching["attempt_id"] or
+                        persisted.get("status") != "dispatching"):
+                    set_job(job_id, **{journal_key: execution})
+                    raise RuntimeError("AWS dispatch journal could not be saved; task was not started")
+                execution = dispatching
+
             try:
                 execution = aws_render.dispatch_render(
-                    config, job_id, execution["attempt_id"], assets, settings)
+                    config, job_id, execution["attempt_id"], assets, settings,
+                    on_dispatch=mark_dispatching)
             except Exception:
+                if execution.get("status") == "preparing":
+                    raise
                 execution = aws_render.reconcile_render(config, execution)
                 if not execution.get("task_arn") and not execution.get("result"):
                     raise
-        set_job(job_id, **{journal_key: execution})
+            set_job(job_id, **{journal_key: execution})
     if release_slot:
         release_slot()
     set_job(job_id, phase="render", progress=None, message="encoding video on AWS")
@@ -4831,6 +5353,7 @@ def complete_video_job(job_id, out, folder, pipeline):
                 encoder_pid=None, message=f"done - {size:.1f} MB",
                 tracks=[{"file": str(out), "name": out.name, "video": True}],
                 folder=str(folder))
+        save_video_purge_reference(job_id, out)
         with JOBS_LOCK:
             JOB_FORMS.pop(job_id, None)
             _save_jobs_locked()
@@ -6231,6 +6754,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/aws/status":
             return self._json({"state": aws_signin_status()})
 
+        if u.path == "/api/media/purge":
+            return self._json(media_purge_preview())
+
         if u.path == "/api/subtitles":
             job_id = (q.get("job") or [""])[0]
             job = job_snapshot(job_id)
@@ -6373,6 +6899,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             except ValueError as error:
                 return self._json({"error": str(error)}, 400)
+
+        if u.path == "/api/media/purge":
+            result, status = media_purge_confirm(body)
+            return self._json(result, status)
 
         if u.path == "/api/config":
             if body.get("render_backend") in ("local", "aws"):
@@ -7078,6 +7608,13 @@ dialog::backdrop{background:rgba(0,0,0,.6)}
   </details>
   </div>
 
+  <div class="settings-section"><h4>Saved media cleanup</h4>
+  <div class="hint">Removes local finished videos, audio/artwork, rejected files, and completed job cards. Settings and credentials stay; copies already sent through Slack or email are unaffected. Only media tracked by Suno Studio is removed; untracked files are kept.</div>
+  <div class="hint" id="s_media_purge_preview" aria-live="polite">Open Settings to preview eligible media.</div>
+  <div class="actions"><button type="button" class="ghost" id="s_media_purge_button" onclick="purgeSavedMedia()" disabled>Purge saved media</button>
+    <span class="hint" id="s_media_purge_result" aria-live="polite"></span></div>
+  </div>
+
   <details class="settings-section"><summary>Email intake and delivery</summary>
   <label class="check" style="margin-top:14px"><input type="checkbox" id="s_watch"> Watch Gmail for song requests</label>
   <div class="hint">Reads one label over IMAP. Never marks, moves, or deletes mail.</div>
@@ -7764,6 +8301,67 @@ function openSettings(){
   $('s_path').textContent = 'Suno Studio v' + (CFG.version||'?') + '  ·  settings stored in ' + CFG.config_path;
   providerChanged();
   dlg.showModal();
+  loadSavedMediaPreview();
+}
+
+function mediaPurgeSize(bytes){
+  const size=Math.max(0,Number(bytes)||0);
+  if(size<1024) return `${Math.round(size)} B`;
+  return size<1048576?`${(size/1024).toFixed(1)} KB`:`${(size/1048576).toFixed(1)} MB`;
+}
+function mediaPurgeSummary(preview){
+  if(preview.blocked) return `Unavailable: ${preview.reason||'cleanup is blocked.'}`;
+  const files=Number(preview.files)||0, jobs=Number(preview.jobs)||0;
+  if(!files&&!jobs) return 'Nothing to purge. No eligible local media, rejected files, or completed job cards were found.';
+  return `${files} local files · ${mediaPurgeSize(preview.bytes)} · ${jobs} completed job cards (${Number(preview.videos)||0} videos, ${Number(preview.audio_artwork)||0} audio/artwork, ${Number(preview.rejects)||0} rejected files).${Number(preview.skipped)?` ${Number(preview.skipped)} unavailable or untracked paths skipped.`:""}`;
+}
+async function fetchSavedMediaPreview(){
+  const preview=await (await fetch('/api/media/purge')).json();
+  if(preview.error) throw new Error(preview.error);
+  return preview;
+}
+async function loadSavedMediaPreview(){
+  const button=$('s_media_purge_button'), state=$('s_media_purge_preview');
+  button.disabled=true; state.textContent='Loading saved-media preview…';
+  try{
+    const preview=await fetchSavedMediaPreview();
+    state.textContent=mediaPurgeSummary(preview);
+    button.disabled=!!preview.blocked||(!(Number(preview.files)||0)&&!(Number(preview.jobs)||0));
+  }catch(_error){
+    state.textContent='Could not load the saved-media preview. Check your connection.';
+    button.disabled=false;
+  }
+}
+async function purgeSavedMedia(){
+  const button=$('s_media_purge_button'), result=$('s_media_purge_result');
+  button.disabled=true; result.textContent='';
+  let disableAfter=false, refreshed=false;
+  try{
+    const preview=await fetchSavedMediaPreview();
+    $('s_media_purge_preview').textContent=mediaPurgeSummary(preview);
+    const files=Number(preview.files)||0, jobs=Number(preview.jobs)||0;
+    if(preview.blocked){
+      result.textContent=`Purge unavailable: ${preview.reason||'cleanup is blocked.'}`;
+      disableAfter=true; return;
+    }
+    if(!files&&!jobs){ result.textContent='Nothing to purge.'; disableAfter=true; return; }
+    const question=`Permanently delete ${files} local files (${mediaPurgeSize(preview.bytes)}) and ${jobs} completed job cards? This cannot be undone. This includes finished videos, audio/artwork, and rejected files. Settings and credentials stay; sent Slack/email copies are unaffected.`;
+    if(!window.confirm(question)){ result.textContent='Purge canceled.'; return; }
+    const done=await (await fetch('/api/media/purge',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({confirmed:true,snapshot:preview.snapshot})})).json();
+    if(done.error||!done.ok){
+      result.textContent=done.error||'Purge could not be completed.';
+      await loadSavedMediaPreview(); refreshed=true; return;
+    }
+    result.textContent=`Purge complete: removed ${Number(done.files)||0} files (${mediaPurgeSize(done.bytes)}) and ${Number(done.jobs)||0} completed job cards.`;
+    try{ await refresh(); }catch(_error){ result.textContent+=' The job list could not be refreshed.'; }
+    await loadSavedMediaPreview(); refreshed=true;
+  }catch(_error){
+    result.textContent='Could not complete the saved-media request. Check your connection and try again.';
+  }finally{
+    if(!refreshed) button.disabled=disableAfter;
+  }
 }
 
 let awsChecked = null;

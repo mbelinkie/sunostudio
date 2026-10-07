@@ -130,7 +130,7 @@ def _run_task(config, mode, attempt, manifest_uri):
     return response["tasks"][0]["taskArn"]
 
 
-def _dispatch(config, job_id, attempt, assets, settings, mode):
+def _dispatch(config, job_id, attempt, assets, settings, mode, on_dispatch=None):
     config = _config(config)
     job_id, attempt = _identity(job_id, "job id"), _identity(attempt, "attempt id")
     prefix = f"{mode}-inputs/{job_id}/{attempt}"
@@ -166,6 +166,8 @@ def _dispatch(config, job_id, attempt, assets, settings, mode):
         "result_uri": _uri(config, f"{result_prefix}/result.json"),
     }
     manifest_uri = _put_json_once(config, f"{prefix}/manifest.json", manifest)
+    if on_dispatch:
+        on_dispatch()
     task_arn = _run_task(config, mode, attempt, manifest_uri)
     return {"mode": mode, "attempt_id": attempt, "job_id": job_id,
             "task_arn": task_arn, "manifest_uri": manifest_uri,
@@ -173,10 +175,10 @@ def _dispatch(config, job_id, attempt, assets, settings, mode):
             "status": "running"}
 
 
-def dispatch_render(config, job_id, attempt, assets, settings):
+def dispatch_render(config, job_id, attempt, assets, settings, on_dispatch=None):
     if not assets.get("audio") or not assets.get("background"):
         raise ValueError("audio and prepared background are required")
-    return _dispatch(config, job_id, attempt, assets, settings, "render")
+    return _dispatch(config, job_id, attempt, assets, settings, "render", on_dispatch)
 
 
 def dispatch_slack_delivery(config, job_id, attempt, mp4, channel_id, caption="", filename=""):

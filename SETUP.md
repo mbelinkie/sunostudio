@@ -38,8 +38,8 @@ retry does not regenerate the song or video.
 
 ## Release downloads
 
-Download `SunoStudio-6.0.7-macOS.zip` or
-`SunoStudio-6.0.7-source.zip` from the [GitHub Releases
+Download `SunoStudio-6.0.8-macOS.zip` or
+`SunoStudio-6.0.8-source.zip` from the [GitHub Releases
 page](https://github.com/mbelinkie/sunostudio/releases/latest). Extract the
 whole archive before launching. The macOS ZIP contains the `.app` and this
 guide beside it; the source ZIP contains the `.bat` launcher beside
@@ -52,8 +52,8 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
 ## Make your first song locally
 
 1. Open [GitHub Releases](https://github.com/mbelinkie/sunostudio/releases/latest).
-   Download `SunoStudio-6.0.7-macOS.zip` for the Mac app or
-   `SunoStudio-6.0.7-source.zip` for the source and Windows launcher.
+   Download `SunoStudio-6.0.8-macOS.zip` for the Mac app or
+   `SunoStudio-6.0.8-source.zip` for the source and Windows launcher.
    Extract the full ZIP. Run the Windows launcher from inside its extracted
    folder; it must stay beside `suno_studio.py`.
 2. Install [Python 3.9 or later](https://www.python.org/downloads/). Suno
@@ -62,7 +62,7 @@ matches `APP_VERSION` and writes the two ZIPs under `dist/`.
    and `drawtext` support before making a video; see **Video tools** below.
 3. Start the app:
 
-   - macOS: move `Suno Studio 6.0.7.app` to Applications and double-click it. The
+   - macOS: move `Suno Studio 6.0.8.app` to Applications and double-click it. The
      app ZIP is not signed or notarized; if Gatekeeper blocks it, control-click
      the app, choose **Open**, and confirm. The app bundle requires Python and
      FFmpeg installed on the Mac.
@@ -304,3 +304,10 @@ summary to the maintainer's Sentry project. The DSN is embedded in the app;
 `SUNO_STUDIO_SENTRY_DSN` can override it for testing or a release. The report
 does not include lyrics, media, credentials, or automatic telemetry. Users do
 not need a Sentry account or DSN.
+
+## Clearing saved media
+
+In Settings, use **Purge saved media** to review the local file count and size,
+then confirm permanent deletion of finished videos, audio, artwork, and rejected
+files. Settings and credentials are preserved; unfinished work or delivery prevents cleanup.
+Copies already delivered to Slack or email are unaffected.

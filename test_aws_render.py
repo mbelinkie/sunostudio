@@ -138,6 +138,21 @@ class AWSRenderTests(unittest.TestCase):
             self.assertNotIn(str(font), json.dumps(manifests[0]))
             self.assertEqual(len(manifests[0]["drawtext_assets"]), 1)
 
+    def test_render_dispatch_callback_runs_after_manifest_before_task(self):
+        events = []
+        with patch.object(aws_render, "_upload_file",
+                          side_effect=lambda _c, _p, key: events.append("upload:" + key) or {}), \
+                patch.object(aws_render, "_put_json_once",
+                             side_effect=lambda _c, _k, _m: events.append("manifest") or
+                             "s3://private-bucket/manifest.json"), \
+                patch.object(aws_render, "_run_task",
+                             side_effect=lambda *_args: events.append("run_task") or "task-arn"):
+            aws_render.dispatch_render(
+                CONFIG, "job12345", "attempt12345",
+                {"audio": "song.mp3", "background": "art.png"}, {},
+                on_dispatch=lambda: events.append("dispatching"))
+        self.assertEqual(events[-3:], ["manifest", "dispatching", "run_task"])
+
     def test_three_day_link_never_contains_signing_secret(self):
         with patch.object(aws_render, "upload_delivery_object", return_value={
             "uri": "s3://private-bucket/delivery-objects/job12345/video.mp4"}):

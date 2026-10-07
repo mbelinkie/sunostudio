@@ -2,6 +2,8 @@ import io
 import inspect
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 import urllib.parse
@@ -37,6 +39,60 @@ def post_json(path, payload):
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_saved_media_purge_requires_confirmation_and_posts_snapshot(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable")
+        start = app.PAGE.index("function mediaPurgeSize(")
+        end = app.PAGE.index("let awsChecked", start)
+        functions = app.PAGE[start:end]
+        setup = r"""
+const run = async mode => {
+  const elements = Object.fromEntries(['s_media_purge_button','s_media_purge_preview',
+    's_media_purge_result'].map(id=>[id,{disabled:false,textContent:''}]));
+  const calls=[]; let confirmCount=0, refreshes=0, gets=0, question='';
+  globalThis.$=id=>elements[id];
+  globalThis.window={confirm:text=>{confirmCount++; question=text; return mode==='confirmed';}};
+  globalThis.refresh=async()=>{refreshes++;};
+  globalThis.fetch=async (url,options={})=>{
+    const method=options.method||'GET'; calls.push({url,method,body:options.body});
+    if(method==='POST') return {json:async()=>({ok:true,files:2,bytes:2048,jobs:1})};
+    gets++;
+    if(mode==='blocked') return {json:async()=>({blocked:true,reason:'render active',files:2,bytes:2048,jobs:0,snapshot:'blocked'})};
+    if(mode==='confirmed' && gets>1) return {json:async()=>({files:0,bytes:0,jobs:0,videos:0,audio_artwork:0,rejects:0,snapshot:'empty'})};
+    return {json:async()=>({files:2,bytes:2048,jobs:1,videos:1,audio_artwork:1,rejects:0,snapshot:'snapshot-1'})};
+  };
+  await purgeSavedMedia();
+  return {calls,confirmCount,question,refreshes,result:elements.s_media_purge_result.textContent,
+    preview:elements.s_media_purge_preview.textContent};
+};
+"""
+        finish = r"""
+(async()=>console.log(JSON.stringify({
+  canceled:await run('canceled'), blocked:await run('blocked'), confirmed:await run('confirmed')
+})))().catch(error=>{console.error(error);process.exit(1);});
+"""
+        completed = subprocess.run([node, "-e", setup + functions + finish],
+                                   capture_output=True, text=True, timeout=10, check=True)
+        result = json.loads(completed.stdout)
+        canceled, blocked, confirmed = (result[k] for k in ("canceled", "blocked", "confirmed"))
+        self.assertFalse(any(call["method"] == "POST" for call in canceled["calls"]))
+        self.assertIn("2 local files", canceled["question"])
+        self.assertIn("Permanently delete", canceled["question"])
+        self.assertIn("cannot be undone", canceled["question"])
+        self.assertIn("2.0 KB", canceled["question"])
+        self.assertEqual(blocked["confirmCount"], 0)
+        self.assertFalse(any(call["method"] == "POST" for call in blocked["calls"]))
+        self.assertIn("render active", blocked["preview"])
+        post = next(call for call in confirmed["calls"] if call["method"] == "POST")
+        self.assertEqual(post["url"], "/api/media/purge")
+        self.assertEqual(json.loads(post["body"]), {"confirmed": True, "snapshot": "snapshot-1"})
+        self.assertEqual(confirmed["refreshes"], 1)
+        self.assertEqual(sum(call["method"] == "GET" for call in confirmed["calls"]), 2)
+        self.assertIn("Settings and credentials stay", confirmed["question"])
+        self.assertIn("sent Slack/email copies are unaffected", confirmed["question"])
+        self.assertIn("Purge complete", confirmed["result"])
+
     def test_generation_keeps_only_first_provider_version(self):
         tracks = [{"id": "first"}, {"id": "second"}]
         self.assertEqual(app.primary_track_only(tracks), [{"id": "first"}])
