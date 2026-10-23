@@ -563,6 +563,20 @@ class DisplayLyricsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same sung letters"):
             app.validate_display_lyrics(spoken, shown.replace("JSON", "JASON"))
 
+    def test_s_three_display_pair_keeps_word_timing(self):
+        line = "We got the goldmine workflow in the bucket of S-three"
+        spoken = "[Verse 2]\n" + line
+        shown = spoken.replace("S-three", "S3")
+        app.validate_display_lyrics(spoken, shown)
+        words = timed_lines([line], {0: "[Verse 2]"},
+                            split={"S-three": ["S", "three"]})
+        groups = app.karaoke_groups(words, spoken, display_lyrics=shown)
+        self.assertEqual(groups[0][0][-1]["w"], "S3")
+        self.assertEqual((groups[0][0][-1]["s"], groups[0][0][-1]["e"]),
+                         (words[-2]["startS"], words[-1]["endS"]))
+        with self.assertRaisesRegex(ValueError, "same sung letters"):
+            app.validate_display_lyrics(spoken, shown.replace("S3", "S4"))
+
     def test_slack_id_is_metadata_only(self):
         form = app.parse_request("Song", "===EMAIL===\na@example.com\n"
                                  "===SLACK ID===\nC01234567\n===LYRICS===\nHello")
