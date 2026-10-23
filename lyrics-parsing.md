@@ -64,8 +64,9 @@ Take the GMAT and SAT today
 used only after timing is known. Keep the same section tags and nonempty lyric
 lines in the same order. Each display word must keep the sung letters in order
 or use one of the app's changed-letter pronunciation pairs from
-`acronym_pronunciations` (such as `JAY-SON`/`JSON` or `R-AND-B`/`R&B`). If that
-sheet gains a new changed-letter pair, add it to `validate_display_lyrics`.
+`acronym_pronunciations` (such as `JAY-SON`/`JSON`, `R-AND-B`/`R&B`, or
+`S-three`/`S3`). If that sheet gains a new changed-letter pair, add it to
+`validate_display_lyrics`.
 A mismatch is shown in the inbox
 and blocks generation before Suno is called. Without the second block, existing
 behavior applies. An acronym timed as several Suno words becomes one displayed

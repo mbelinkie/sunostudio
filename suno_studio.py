@@ -6313,7 +6313,8 @@ def validate_display_lyrics(lyrics, display_lyrics):
                     (_chars(sung), _chars(shown)) not in {
                         ("jayson", "json"), ("randb", "rb"),
                         ("genesis", "gnsys"), ("jot", "jwt"),
-                        ("pants", "pance"), ("toeful", "toefl")}
+                        ("pants", "pance"), ("toeful", "toefl"),
+                        ("sthree", "s3")}
                     for sung, shown in zip(sung_words, shown_words)):
                 raise ValueError(f"Display line must keep the same sung letters: {display_line['text']!r}")
 
