@@ -1,0 +1,1033 @@
+{
+  "cloud": true,
+  "rules": [
+    {
+      "id": 11426878,
+      "clientKey": "82cb6313-de96-30ce-96c1-297c600ed5c3",
+      "name": "Sprint Song Debug - names and Slack overrides",
+      "state": "DISABLED",
+      "description": "Manual Apps Script tests. Team/sprint metadata is resolved from Jira and Boards Index. Before enabling this disabled template, replace Slack C00000000 with the configured isolated test destination. No production shims point here.",
+      "authorAccountId": "70121:231dedb9-b292-496b-957d-1b93075523c4",
+      "actor": {
+        "type": "ACCOUNT_ID",
+        "value": "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077"
+      },
+      "created": 1785897453792,
+      "updated": 1787844356987,
+      "trigger": {
+        "id": "9ebf802f-0d17-437f-8bab-757763916606",
+        "parentId": null,
+        "conditionParentId": null,
+        "component": "TRIGGER",
+        "type": "jira.incoming.webhook",
+        "value": {
+          "webhookToken": "",
+          "searchOrProvide": "none",
+          "jql": null
+        },
+        "conditions": [],
+        "children": [],
+        "schemaVersion": 1,
+        "connectionId": null,
+        "checksum": null
+      },
+      "components": [
+        {
+          "id": "1bee0915-6a51-451f-ac69-af36ce1dd711",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.configVersion}}",
+            "second": "2",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "d9bcd9a7-7b0d-499d-b715-e3b5aad9d787",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.source}}",
+            "second": "boards-index-debug",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "b89b0c66-e2c6-49e7-a08d-8a164e7a5802",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.isTest}}",
+            "second": "true",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "e9b95ddd-3f49-413b-8157-e599e6e2eee8",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.deliveryMode}}:{{webhookData.deliverySlackChannelId}}",
+            "second": "slack:C00000000",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "288df9e4-1b47-4e9d-8ce4-80b149d24555",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.emailAddress}}",
+            "second": "",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "16f41eb2-3998-4952-827c-e6538d40310e",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.testRunId}}",
+            "second": "",
+            "operator": "NOT_EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "59f98ac3-16bf-4526-a78a-55c684ee0ac6",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.duplicateKey}}",
+            "second": "test:{{webhookData.testRunId}}",
+            "operator": "EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "2e91d6b2-1a48-4dc0-824a-cecd63d0c0b7",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.sprintId}}",
+            "second": "",
+            "operator": "NOT_EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "4c8eeadb-57c4-4781-b521-3b9fec84aee9",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.comparator.condition",
+          "value": {
+            "first": "{{webhookData.jiraProject}}",
+            "second": "",
+            "operator": "NOT_EQUALS"
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "ec4279b0-8be0-4479-99e4-afab5c5f2212",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "codebarrel.action.log",
+          "value": "RAW WEBHOOK: {{webhookData}}",
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "e06febea-b4c2-4bce-bd5c-958ca86297ed",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785898215370",
+            "name": {
+              "type": "FREE",
+              "value": "sprintName"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.closedSprintName}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "0328641a-0d11-4686-a51e-f2ffaea5e449",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785898258649",
+            "name": {
+              "type": "FREE",
+              "value": "boardId"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.boardId}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "87df1cd9-6eba-4c57-8ee7-d702ab182e8a",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785900348624",
+            "name": {
+              "type": "FREE",
+              "value": "sprintId"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.sprintId}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "24ef504e-b292-4d51-8d9a-c68efb9cbf94",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785900404244",
+            "name": {
+              "type": "FREE",
+              "value": "sprintStart"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.sprintStart}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "820123f4-7e35-4f2b-8dd2-fda2e57f4081",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785900428407",
+            "name": {
+              "type": "FREE",
+              "value": "sprintEnd"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.sprintEnd}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "d65a2fe6-69cd-4fca-9c7d-0b3aa9c723e6",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785900451073",
+            "name": {
+              "type": "FREE",
+              "value": "sprintGoal"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.sprintGoal}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "564ed9ad-3b9c-4768-b0f5-54d3e49509e0",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "codebarrel.action.log",
+          "value": "CONFIG RECEIVED: board={{webhookData.boardId}} source={{webhookData.source}}",
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "70ff32a5-8b4c-48bb-ada9-381548cc76bb",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1786423116444",
+            "name": {
+              "type": "FREE",
+              "value": "teamName"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.teamName}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "939f224d-0ae6-414c-ad85-ed87f9f9427f",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785421122440",
+            "name": {
+              "type": "FREE",
+              "value": "jiraProject"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.jiraProject}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "c9909f55-ffc3-4660-9312-691b5d2fa03c",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785416043380",
+            "name": {
+              "type": "FREE",
+              "value": "emailAddress"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.emailAddress}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "3e5d619d-811a-4ad7-93e8-bc2ef4a7d8a8",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785421032151",
+            "name": {
+              "type": "FREE",
+              "value": "slackChannelId"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.slackChannelId}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "8c1bb679-cbed-4a66-ae29-13e7596f2c8c",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785421084105",
+            "name": {
+              "type": "FREE",
+              "value": "genreSelect"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.genreSelect}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "f7ffccee-1db8-4d38-bdb6-0e5bdab5f27e",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1790621612656",
+            "name": {
+              "type": "FREE",
+              "value": "namesInSongs"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.namesInSongs}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "6a068206-fb9b-4e45-b1b1-32c3087923ea",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785901600303",
+            "name": {
+              "type": "FREE",
+              "value": "sendSongFlag"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.sendSongFlag}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "73589a31-1340-455a-b62a-cc743cabc529",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "codebarrel.action.log",
+          "value": "CONFIG EXTRACTED: project={{jiraProject}}| email={{emailAddress}}| slack_id={{slackChannelId}}| genre={{genreSelect}}| names_in_songs={{namesInSongs}}|",
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "f13fd391-01ac-4c1b-b900-6d3bd9fd78c4",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.lookup.issues",
+          "value": {
+            "id": "_customsmartvalue_id_1785382354711",
+            "name": {
+              "type": "FREE",
+              "value": "lookupIssues"
+            },
+            "type": "JQL",
+            "query": {
+              "type": "SMART",
+              "value": "project = {{jiraProject}} AND sprint = {{sprintId}} AND statusCategory = Done and issuetype != Incident"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "8d99e8b7-e4c3-4b45-bc16-c2147e914388",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785382380562",
+            "name": {
+              "type": "FREE",
+              "value": "doneCount"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{lookupIssues.size}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "036c4136-1386-4ed7-b7ad-2fdb3e8a0b8b",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785382442642",
+            "name": {
+              "type": "FREE",
+              "value": "donePoints"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{lookupIssues.Story Points.sum}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "2d3ac484-86c3-434e-866c-28083b8402cd",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785382477527",
+            "name": {
+              "type": "FREE",
+              "value": "doneList"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{#lookupIssues}}{{key}} — {{summary}} | {{/}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "c47f3606-a45f-440a-9736-750c77b35a5e",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.lookup.issues",
+          "value": {
+            "id": "_customsmartvalue_id_1785382354711",
+            "name": {
+              "type": "FREE",
+              "value": "lookupIssues"
+            },
+            "type": "JQL",
+            "query": {
+              "type": "SMART",
+              "value": "project = {{jiraProject}} AND sprint = {{sprintId}} AND statusCategory = Done and issuetype = Incident"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "ab00c7eb-5704-42e4-8f57-e8c0f83ba132",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785382380562",
+            "name": {
+              "type": "FREE",
+              "value": "doneCountInc"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{lookupIssues.size}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "6d6ef4bf-0def-4ba4-8308-8cabb366091a",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.lookup.issues",
+          "value": {
+            "id": "_customsmartvalue_id_1785382567959",
+            "name": {
+              "type": "FREE",
+              "value": "lookupIssues"
+            },
+            "type": "JQL",
+            "query": {
+              "type": "SMART",
+              "value": "project = {{jiraProject}} AND sprint = {{sprintId}} AND issuetype in (\"Pre-production Bugs\", \"Post-production Bugs\", \"Incident\", \"Defect Sub-task\") AND statusCategory = Done"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "d41b2878-7b6e-4d87-84de-d33b08902507",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785384193720",
+            "name": {
+              "type": "FREE",
+              "value": "bugCount"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{lookupIssues.size}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "74e681af-b497-42f0-be6d-caf8f72f705e",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_1785384201523",
+            "name": {
+              "type": "FREE",
+              "value": "bugList"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{#lookupIssues}}{{summary}} | {{/}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "621c32a0-fc86-4f6e-9790-58eda8bbe977",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "jira.create.variable",
+          "value": {
+            "id": "_customsmartvalue_id_c551d4634d364f1684ad8cfa59c3cc9f",
+            "name": {
+              "type": "FREE",
+              "value": "slackDigest"
+            },
+            "type": "SMART",
+            "query": {
+              "type": "SMART",
+              "value": "{{webhookData.emailAddress}}"
+            },
+            "lazy": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "13be311d-fec0-434a-89fb-4939b42b9591",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "C00000000",
+          "type": "jira.condition.container.block",
+          "value": null,
+          "conditions": [],
+          "children": [
+            {
+              "id": "77f1b025-7423-4bbf-bdda-ea6348d6b350",
+              "parentId": "13be311d-fec0-434a-89fb-4939b42b9591",
+              "conditionParentId": null,
+              "component": "CONDITION_BLOCK",
+              "type": "jira.condition.if.block",
+              "value": {
+                "conditionMatchType": "ALL"
+              },
+              "conditions": [
+                {
+                  "id": "b056ab2d-8c5d-4412-9d8a-094d633d8976",
+                  "parentId": null,
+                  "conditionParentId": "77f1b025-7423-4bbf-bdda-ea6348d6b350",
+                  "component": "C00000000",
+                  "type": "jira.comparator.condition",
+                  "value": {
+                    "first": "{{slackChannelId}}",
+                    "second": "",
+                    "operator": "NOT_EQUALS"
+                  },
+                  "conditions": [],
+                  "children": [],
+                  "schemaVersion": 1,
+                  "connectionId": null,
+                  "checksum": null
+                }
+              ],
+              "children": [
+                {
+                  "id": "492c704a-6752-4f7b-b938-96ff8dd4e565",
+                  "parentId": "77f1b025-7423-4bbf-bdda-ea6348d6b350",
+                  "conditionParentId": null,
+                  "component": "ACTION",
+                  "type": "rovo.invoke-agent.action",
+                  "value": {
+                    "tagValue": "0de71b2c-ca9f-41b2-9d0c-5cb7f8961b85",
+                    "tagType": "EXTERNAL_AGENT_ID",
+                    "activationId": "77d255d5-fa6a-477d-890e-081a375150b8",
+                    "agentId": "0de71b2c-ca9f-41b2-9d0c-5cb7f8961b85",
+                    "agentNamedId": "0de71b2c-ca9f-41b2-9d0c-5cb7f8961b85",
+                    "agentInstruction": "Summarize the Slack channel {{slackChannelId}} from {{sprintStart}} to {{sprintEnd}}.",
+                    "agentAAID": "712020:6da3fbab-74ed-49a2-8564-cb6a2873a4ab",
+                    "agentDisplayName": "Slack Channel Summarizer",
+                    "invocationMode": "USER",
+                    "allowAgentToExecuteActions": false,
+                    "isVerified": false
+                  },
+                  "conditions": [],
+                  "children": [],
+                  "schemaVersion": 1,
+                  "connectionId": "1450b31d-34f2-4c76-b1a2-cfc257929555",
+                  "checksum": null
+                },
+                {
+                  "id": "8ea28f0d-2d8c-4108-aac0-3c61041bb8c8",
+                  "parentId": "77f1b025-7423-4bbf-bdda-ea6348d6b350",
+                  "conditionParentId": null,
+                  "component": "ACTION",
+                  "type": "codebarrel.action.log",
+                  "value": "{{agentResponse.asString}}",
+                  "conditions": [],
+                  "children": [],
+                  "schemaVersion": 1,
+                  "connectionId": null,
+                  "checksum": null
+                },
+                {
+                  "id": "8d5ae1f9-904d-4a39-95e1-c55d0a73844f",
+                  "parentId": "77f1b025-7423-4bbf-bdda-ea6348d6b350",
+                  "conditionParentId": null,
+                  "component": "ACTION",
+                  "type": "jira.create.variable",
+                  "value": {
+                    "id": "_customsmartvalue_id_1785424138068",
+                    "name": {
+                      "type": "FREE",
+                      "value": "slackDigest"
+                    },
+                    "type": "SMART",
+                    "query": {
+                      "type": "SMART",
+                      "value": "{{agentResponse.asString}}"
+                    },
+                    "lazy": false
+                  },
+                  "conditions": [],
+                  "children": [],
+                  "schemaVersion": 1,
+                  "connectionId": null,
+                  "checksum": null
+                }
+              ],
+              "schemaVersion": 1,
+              "connectionId": null,
+              "checksum": null
+            }
+          ],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "84f60cf4-4e1f-437d-8947-44f17b2d2786",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "codebarrel.action.log",
+          "value": "WRITER INPUT: email={{emailAddress}}| genre={{genreSelect}}| slack_id={{slackChannelId}}| names_in_songs={{namesInSongs}}| sprint_id={{sprintId}}| team={{teamName}}| sprint={{sprintName}}",
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        },
+        {
+          "id": "87cd96d6-a415-44f1-bdfa-8922c19c11d7",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "rovo.invoke-agent.action",
+          "value": {
+            "tagValue": "014e72ee-f2a2-49c7-bb0b-bde36c4a88fc",
+            "tagType": "EXTERNAL_AGENT_ID",
+            "activationId": "77d255d5-fa6a-477d-890e-081a375150b8",
+            "agentId": "014e72ee-f2a2-49c7-bb0b-bde36c4a88fc",
+            "agentNamedId": "014e72ee-f2a2-49c7-bb0b-bde36c4a88fc",
+            "agentInstruction": "Write a sprint song.\nEMAIL: {{emailAddress}}\nGENRE: {{genreSelect}}\nSLACK_CHANNEL_ID: {{slackChannelId}}\nNAMES IN SONGS: {{namesInSongs}}\nNAME POLICY: {{webhookData.namePolicy}}\nALLOWED SONG NAMES:\n{{webhookData.allowedSongNames}}\nSPRINT_ID: {{sprintId}}\nTEAM: {{teamName}}\nSPRINT: {{sprintName}}\nDATES: {{sprintStart}} to {{sprintEnd}}\nSPRINT GOAL:\n{{sprintGoal}}\nCOMPLETED: {{doneCount}} work items and {{doneCountInc}} support incidents\nSTORY POINTS: {{donePoints}}\nOF THOSE, BUGS AND DEFECTS: {{bugCount}}\nWORK COMPLETED:\n{{doneList}}\nBUGS AND DEFECTS FIXED:\n{{bugList}}\nTEAM CHAT DURING THE SPRINT:\n{{slackDigest}}\nIf TEAM CHAT DURING THE SPRINT is blank, use only the sprint goal and Jira work above; do not invent chat activity.\n\nThis is an internal test. NAMES IN SONGS is binding: for n use no personal names in title, sung lyrics or display lyrics; for y use at most three team members, only for accomplishments explicitly credited in the provided chat. If no credited names are provided, use none. Never invent a name. When NAME POLICY is allowed-roster-only, use only the listed lyric names; aliases identify those people but do not prove an accomplishment. An empty allowed roster means no names.\nDo not include email, Slack destination or delivery instructions. Slack is a source of sprint facts only.\nReturn ===TITLE===, ===STYLE===, ===LYRICS===, ===SPRINT===, ===INFOGRAPHIC=== and ===END=== sections. LYRICS is sent to the song provider to be sung and contains pronunciation spelling. DISPLAY LYRICS is optional and supplies the words shown in the lyric video; include ===DISPLAY LYRICS=== only when display spelling differs. Keep the same sections, lines, whitespace-separated word count and word order in both blocks. Limit display changes to case, punctuation or hyphens that preserve each word’s letters, and these sung-to-display pairs: Jay-son → JSON, RandB → R&B, Genesis → GNSYS, jot → JWT, pants → PANCE, toeful → TOEFL. Do not add, remove, reorder or paraphrase words. Do not invent chat facts when the digest is empty.",
+            "agentAAID": "712020:f6b7bc03-4024-4b4b-8d7a-66d9cfb61d30",
+            "agentDisplayName": "Sprint Song Writer",
+            "invocationMode": "USER",
+            "allowAgentToExecuteActions": false,
+            "isVerified": false
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": "1450b31d-34f2-4c76-b1a2-cfc257929555",
+          "checksum": null
+        },
+        {
+          "id": "89f98657-ecdb-4a4b-b56e-aad8101808c8",
+          "parentId": null,
+          "conditionParentId": null,
+          "component": "ACTION",
+          "type": "action.send-templated-email",
+          "value": {
+            "to": [
+              {
+                "type": "FREE",
+                "value": "owner@example.invalid"
+              },
+              {
+                "type": "FREE",
+                "value": "owner@example.invalid"
+              }
+            ],
+            "convertLineBreaks": false,
+            "templateContextData": {
+              "emailName": "lyrics",
+              "body": "{{agentResponse.asString.replace(\"===END===\", \"\").trim()}}\n\n===DELIVERY===\nslack\n\n===SLACK CHANNEL ID===\n{{webhookData.deliverySlackChannelId}}\n\n===END===",
+              "bodyType": "PLAIN_TEXT",
+              "subject": "[SPRINT SONG] TEST {{teamName}} — {{sprintName}} — {{webhookData.testRunId}}",
+              "fromEmailAddress": "noreply@example.invalid"
+            },
+            "sendGroupedEmails": true,
+            "legacyConfig": true
+          },
+          "conditions": [],
+          "children": [],
+          "schemaVersion": 1,
+          "connectionId": null,
+          "checksum": null
+        }
+      ],
+      "canOtherRuleTrigger": false,
+      "notifyOnError": "FIRSTERROR",
+      "projects": [],
+      "labels": [],
+      "tags": [],
+      "ruleScope": {
+        "resources": [
+          "ari:cloud:jira::site/1adb1458-27ce-48b5-b2dd-f941f014629d"
+        ]
+      },
+      "ruleHome": {
+        "ruleLifecycleHome": {
+          "locationARI": "ari:cloud:jira-software::site/1adb1458-27ce-48b5-b2dd-f941f014629d"
+        },
+        "ruleBillingHome": {
+          "locationARI": "ari:cloud:jira-software::site/1adb1458-27ce-48b5-b2dd-f941f014629d"
+        }
+      },
+      "writeAccessType": "OWNER_ONLY",
+      "readAccessType": "UNRESTRICTED",
+      "collaborators": [],
+      "billingType": "NORMAL",
+      "idUuid": "019fcfc8-88e0-78aa-8b39-3de6b5b1649a",
+      "partitionId": "e925591f-e8cd-4f85-8504-f6ae9ac3f3fd",
+      "checksum": {
+        "version": 3,
+        "value": "bc144121a88dfb1f76e2b5d6958dd57b170e7c5fbab53378687fdf8442555a21"
+      },
+      "currentVersionId": null,
+      "ruleArchetype": null,
+      "editRestrictions": null
+    }
+  ],
+  "connections": [
+    {
+      "id": "1450b31d-34f2-4c76-b1a2-cfc257929555",
+      "connectionTargetKey": "com.atlassian.rovo",
+      "targetConfigJson": "{\"product\":\"jira\",\"cloudId\":\"1adb1458-27ce-48b5-b2dd-f941f014629d\"}",
+      "authType": "ASAP",
+      "container": {
+        "id": "019fcfc8-88e0-78aa-8b39-3de6b5b1649a",
+        "type": "RULE"
+      },
+      "createdAt": "2026-08-05T02:37:33.969531Z",
+      "updatedAt": "2026-08-05T02:37:33.969531Z"
+    }
+  ]
+}
