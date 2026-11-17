@@ -261,19 +261,22 @@ def wait_or_poll_render(config, execution, wait_seconds=0):
     deadline = time.monotonic() + max(0, float(wait_seconds))
     while True:
         result = _get_json(config, execution["result_uri"])
+        task_arn = execution.get("task_arn")
+        if not result and task_arn:
+            tasks = _client("ecs", config["region"], config.get("profile")).describe_tasks(
+                cluster=config["cluster"], tasks=[task_arn]).get("tasks", [])
+            if tasks and tasks[0].get("lastStatus") == "STOPPED":
+                # The worker can write its result between the first S3 read and this ECS check.
+                result = _get_json(config, execution["result_uri"])
+                if not result:
+                    return {**execution, "status": "failed", "result": {
+                        "error": tasks[0].get("stoppedReason") or "task stopped without a result"}}
         if result:
             if (result.get("attempt_id") != execution.get("attempt_id") or
                     execution.get("job_id") and result.get("job_id") != execution["job_id"]):
                 raise RuntimeError("cloud result does not match this task attempt")
             status = result.get("status")
             return {**execution, "status": status, "result": result}
-        task_arn = execution.get("task_arn")
-        if task_arn:
-            tasks = _client("ecs", config["region"], config.get("profile")).describe_tasks(
-                cluster=config["cluster"], tasks=[task_arn]).get("tasks", [])
-            if tasks and tasks[0].get("lastStatus") == "STOPPED":
-                return {**execution, "status": "failed", "result": {
-                    "error": tasks[0].get("stoppedReason") or "task stopped without a result"}}
         if time.monotonic() >= deadline:
             return {**execution, "status": "running"}
         time.sleep(min(5, deadline - time.monotonic()))
