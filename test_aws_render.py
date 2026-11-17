@@ -262,6 +262,20 @@ class AWSRenderTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "succeeded")
         self.assertEqual(recovered["result"], result)
 
+    def test_poll_recovers_slack_receipt_written_as_task_stops(self):
+        execution = {"mode": "delivery", "attempt_id": "attempt12345", "job_id": "job12345",
+                     "task_arn": "task-arn", "result_uri": "s3://private-bucket/result.json"}
+        receipt = {"status": "succeeded", "attempt_id": "attempt12345", "job_id": "job12345",
+                   "file_id": "F12345678", "channel_id": "C12345678"}
+        ecs = unittest.mock.Mock()
+        ecs.describe_tasks.return_value = {"tasks": [
+            {"lastStatus": "STOPPED", "stoppedReason": "Essential container in task exited"}]}
+        with patch.object(aws_render, "_client", return_value=ecs), \
+                patch.object(aws_render, "_get_json", side_effect=[None, receipt]):
+            result = aws_render.wait_or_poll_render(CONFIG, execution)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["result"], receipt)
+
     def test_poll_rejects_a_result_for_a_different_attempt(self):
         execution = {"attempt_id": "attempt12345", "job_id": "job12345",
                      "result_uri": "s3://private-bucket/result.json"}
